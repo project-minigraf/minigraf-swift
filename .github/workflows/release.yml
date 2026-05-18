@@ -1,0 +1,169 @@
+name: Swift Release
+
+on:
+  repository_dispatch:
+    types: [core-release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Pin version, commit, tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      semver: ${{ steps.ver.outputs.semver }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+
+      - id: ver
+        run: |
+          V="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          echo "tag=$V" >> "$GITHUB_OUTPUT"
+          echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Wait for minigraf to appear on crates.io sparse index
+        run: |
+          SEMVER="${{ steps.ver.outputs.semver }}"
+          for i in $(seq 1 10); do
+            if cargo search minigraf --limit 1 2>/dev/null | grep -q "minigraf = \"$SEMVER\""; then
+              echo "minigraf $SEMVER found on crates.io (attempt $i)"
+              break
+            fi
+            echo "Attempt $i/10: not yet visible, waiting 15s..."
+            sleep 15
+          done
+
+      - name: Pin minigraf version in Cargo.toml
+        run: |
+          sed -i 's/^minigraf = "=[^"]*"/minigraf = "=${{ steps.ver.outputs.semver }}"/' Cargo.toml
+
+      - name: Update Cargo.lock
+        run: cargo update --precise "${{ steps.ver.outputs.semver }}" minigraf
+
+      - name: Commit and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release ${{ steps.ver.outputs.tag }}"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin main --follow-tags
+
+  build-and-publish:
+    name: Build xcframework and publish
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Build iOS device library
+        run: cargo build --target aarch64-apple-ios --release
+
+      - name: Build iOS simulator library
+        run: cargo build --target aarch64-apple-ios-sim --release
+
+      - name: Generate Swift bindings
+        run: |
+          mkdir -p Sources/MinigrafKit
+          cargo run --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-ios/release/libminigraf_ffi.a \
+            --language swift \
+            --out-dir Sources/MinigrafKit/
+
+      - name: Prepare headers for xcframework
+        run: |
+          mkdir -p includes
+          cp Sources/MinigrafKit/*.h includes/ 2>/dev/null || true
+          cp Sources/MinigrafKit/*.modulemap includes/ 2>/dev/null || true
+
+      - name: Assemble xcframework
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libminigraf_ffi.a \
+            -headers includes/ \
+            -library target/aarch64-apple-ios-sim/release/libminigraf_ffi.a \
+            -headers includes/ \
+            -output "MinigrafKit.xcframework"
+          zip -r "MinigrafKit-${TAG}.xcframework.zip" MinigrafKit.xcframework
+
+      - name: Create GitHub Release and upload xcframework
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "MinigrafKit $TAG" \
+            --notes "Swift/iOS binding for minigraf $TAG."
+          gh release upload "$TAG" "MinigrafKit-${TAG}.xcframework.zip" \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Compute checksum and update Package.swift
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          CHECKSUM=$(shasum -a 256 "MinigrafKit-${TAG}.xcframework.zip" | awk '{print $1}')
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/MinigrafKit-${TAG}.xcframework.zip"
+          sed -i '' \
+            -e "s|url: \"https://github.com/.*/releases/download/.*/MinigrafKit-.*\\.xcframework\\.zip\"|url: \"${URL}\"|" \
+            -e "s|checksum: \"[^\"]*\"|checksum: \"${CHECKSUM}\"|" \
+            Package.swift
+
+      - name: Commit Package.swift and Swift sources to swift-releases branch
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          TMPDIR_SWIFT=$(mktemp -d)
+          cp Package.swift "$TMPDIR_SWIFT/Package.swift"
+          cp -r Sources/MinigrafKit/ "$TMPDIR_SWIFT/MinigrafKit"
+
+          if git fetch origin swift-releases 2>/dev/null; then
+            git checkout -fB swift-releases origin/swift-releases
+          else
+            git checkout --orphan swift-releases
+            git rm -rf . --quiet 2>/dev/null || true
+          fi
+
+          cp "$TMPDIR_SWIFT/Package.swift" Package.swift
+          mkdir -p Sources/MinigrafKit/
+          cp -r "$TMPDIR_SWIFT/MinigrafKit/." Sources/MinigrafKit/
+          rm -rf "$TMPDIR_SWIFT"
+
+          git add Package.swift Sources/MinigrafKit/
+          git commit -m "chore(release): update Package.swift and Swift bindings for ${TAG}" \
+            || echo "Nothing to commit"
+          git push origin swift-releases --force
+
+          NEW_SHA=$(git rev-parse HEAD)
+          SWIFT_TAG="swift-${TAG}"
+          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -X POST \
+            -f ref="refs/tags/${SWIFT_TAG}" \
+            -f sha="$NEW_SHA" 2>/dev/null \
+          || gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${SWIFT_TAG}" \
+            -X PATCH \
+            -f sha="$NEW_SHA" \
+            -F force=true
