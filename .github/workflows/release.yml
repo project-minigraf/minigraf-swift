@@ -43,6 +43,10 @@ jobs:
             echo "Attempt $i/10: not yet visible, waiting 15s..."
             sleep 15
           done
+          if ! cargo search minigraf --limit 1 2>/dev/null | grep -q "minigraf = \"$SEMVER\""; then
+            echo "ERROR: minigraf@$SEMVER not found on crates.io after all attempts"
+            exit 1
+          fi
 
       - name: Pin minigraf version in Cargo.toml
         run: |
@@ -73,13 +77,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
       - name: Build iOS device library
         run: cargo build --target aarch64-apple-ios --release
 
       - name: Build iOS simulator library
         run: cargo build --target aarch64-apple-ios-sim --release
+
+      - name: Build iOS x86_64 simulator library
+        run: cargo build --target x86_64-apple-ios --release
+
+      - name: Create universal iOS simulator library
+        run: |
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libminigraf_ffi.a \
+            target/x86_64-apple-ios/release/libminigraf_ffi.a \
+            -output libminigraf_ffi_sim_universal.a
 
       - name: Generate Swift bindings
         run: |
@@ -101,7 +115,7 @@ jobs:
           xcodebuild -create-xcframework \
             -library target/aarch64-apple-ios/release/libminigraf_ffi.a \
             -headers includes/ \
-            -library target/aarch64-apple-ios-sim/release/libminigraf_ffi.a \
+            -library libminigraf_ffi_sim_universal.a \
             -headers includes/ \
             -output "MinigrafKit.xcframework"
           zip -r "MinigrafKit-${TAG}.xcframework.zip" MinigrafKit.xcframework
