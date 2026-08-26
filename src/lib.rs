@@ -30,24 +30,20 @@ pub enum MiniGrafError {
     Other { msg: String },
 }
 
-// ─── anyhow::Error → MiniGrafError conversion ────────────────────────────────
+// ─── minigraf::MinigrafError → MiniGrafError conversion ──────────────────────
 
-impl From<anyhow::Error> for MiniGrafError {
-    fn from(e: anyhow::Error) -> Self {
-        let full = format!("{e:#}").to_lowercase();
+impl From<minigraf::MinigrafError> for MiniGrafError {
+    fn from(e: minigraf::MinigrafError) -> Self {
         let msg = e.to_string();
-        if full.contains("parse")
-            || full.contains("unexpected")
-            || full.contains("expected token")
-            || full.contains("unknown command")
-        {
-            MiniGrafError::Parse { msg }
-        } else if full.contains("storage") || full.contains(" page") || full.contains("wal ") {
-            MiniGrafError::Storage { msg }
-        } else if full.contains("query") || full.contains(":find") || full.contains(":where") {
-            MiniGrafError::Query { msg }
-        } else {
-            MiniGrafError::Other { msg }
+        match e.category() {
+            minigraf::ErrorCategory::Parser => MiniGrafError::Parse { msg },
+            minigraf::ErrorCategory::Storage | minigraf::ErrorCategory::Wal => {
+                MiniGrafError::Storage { msg }
+            }
+            minigraf::ErrorCategory::Query => MiniGrafError::Query { msg },
+            minigraf::ErrorCategory::Api | minigraf::ErrorCategory::Internal | _ => {
+                MiniGrafError::Other { msg }
+            }
         }
     }
 }
