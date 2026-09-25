@@ -74,9 +74,19 @@ jobs:
           git push origin main
           git push origin "${{ steps.ver.outputs.tag }}" || true
 
+  # Gate every build/publish job on this binding's test suite, run against the
+  # exact pinned core version that prepare just tagged. ci.yml also runs on the
+  # version-pin push to main, but nothing waits on that run.
+  test:
+    name: Test pinned release
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+
   build-and-publish:
     name: Build xcframework and publish
-    needs: prepare
+    needs: [prepare, test]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
