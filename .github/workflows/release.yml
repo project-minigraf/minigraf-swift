@@ -19,6 +19,7 @@ jobs:
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
       semver: ${{ steps.ver.outputs.semver }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,7 +57,10 @@ jobs:
       - name: Update Cargo.lock
         run: cargo update --precise "${{ steps.ver.outputs.semver }}" minigraf
 
-      - name: Commit and push tag
+      # Push the pin commit to a throwaway branch only. The tag and main are
+      # updated by the tag job, after the test job has passed on this commit.
+      - name: Commit and push release branch
+        id: commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -66,17 +70,52 @@ jobs:
           else
             echo "Cargo.toml already pinned, skipping commit"
           fi
-          if ! git rev-parse "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
-            git tag "${{ steps.ver.outputs.tag }}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git push --force origin "HEAD:refs/heads/release/${{ steps.ver.outputs.tag }}"
+
+  # Run this binding's test suite against the exact pinned core version before
+  # anything becomes visible: no tag, no main update, no publish until it passes.
+  test:
+    name: Test pinned release
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  tag:
+    name: Push tag and update main
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+
+      - name: Push tag, fast-forward main, delete release branch
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          if [ -z "$EXISTING" ]; then
+            REFS=("$SHA:refs/heads/main" "$SHA:refs/tags/$TAG")
+          elif [ "$EXISTING" = "$SHA" ]; then
+            echo "Tag $TAG already points at $SHA, skipping tag push"
+            REFS=("$SHA:refs/heads/main")
           else
-            echo "Tag ${{ steps.ver.outputs.tag }} already exists, skipping"
+            echo "::error::Tag $TAG already exists at $EXISTING, but the tested commit is $SHA. Delete the tag and re-run to release the tested commit."
+            exit 1
           fi
-          git push origin main
-          git push origin "${{ steps.ver.outputs.tag }}" || true
+          # Atomic: main and the tag move together or not at all. Rejected if
+          # main moved during the release; re-run to re-pin on the new main.
+          git push --atomic origin "${REFS[@]}"
+          git push origin --delete "release/$TAG" \
+            || echo "::warning::Could not delete branch release/$TAG"
 
   build-and-publish:
     name: Build xcframework and publish
-    needs: prepare
+    needs: [prepare, tag]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
