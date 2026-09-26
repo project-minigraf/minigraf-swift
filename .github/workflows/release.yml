@@ -82,8 +82,13 @@ jobs:
     with:
       ref: ${{ needs.prepare.outputs.sha }}
 
+  # The source commit gets a non-semver `source-vX` tag. The semver `vX` tag is
+  # what Swift Package Manager resolves, so it goes on the swift-releases commit
+  # that carries the real xcframework URL, checksum and generated Swift sources
+  # (build-and-publish below). A semver tag on the source commit resolves to a
+  # manifest with a placeholder checksum and no Swift sources.
   tag:
-    name: Push tag and update main
+    name: Push source tag and update main
     needs: [prepare, test]
     runs-on: ubuntu-latest
     steps:
@@ -92,9 +97,9 @@ jobs:
           ref: ${{ needs.prepare.outputs.sha }}
           token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
 
-      - name: Push tag, fast-forward main, delete release branch
+      - name: Push source tag, fast-forward main, delete release branch
         env:
-          TAG: ${{ needs.prepare.outputs.tag }}
+          TAG: source-${{ needs.prepare.outputs.tag }}
           SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
@@ -110,8 +115,8 @@ jobs:
           # Atomic: main and the tag move together or not at all. Rejected if
           # main moved during the release; re-run to re-pin on the new main.
           git push --atomic origin "${REFS[@]}"
-          git push origin --delete "release/$TAG" \
-            || echo "::warning::Could not delete branch release/$TAG"
+          git push origin --delete "release/${{ needs.prepare.outputs.tag }}" \
+            || echo "::warning::Could not delete branch release/${{ needs.prepare.outputs.tag }}"
 
   build-and-publish:
     name: Build xcframework and publish
@@ -120,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.prepare.outputs.tag }}
+          ref: source-${{ needs.prepare.outputs.tag }}
           token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
           fetch-depth: 0
 
@@ -169,18 +174,6 @@ jobs:
             -output "MinigrafKit.xcframework"
           zip -r "MinigrafKit-${TAG}.xcframework.zip" MinigrafKit.xcframework
 
-      - name: Create GitHub Release and upload xcframework
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ needs.prepare.outputs.tag }}"
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "MinigrafKit $TAG" \
-            --notes "Swift/iOS binding for minigraf $TAG."
-          gh release upload "$TAG" "MinigrafKit-${TAG}.xcframework.zip" \
-            --repo "$GITHUB_REPOSITORY"
-
       - name: Compute checksum and update Package.swift
         run: |
           TAG="${{ needs.prepare.outputs.tag }}"
@@ -221,13 +214,33 @@ jobs:
           git push origin swift-releases --force
 
           NEW_SHA=$(git rev-parse HEAD)
-          SWIFT_TAG="swift-${TAG}"
-          gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -X POST \
-            -f ref="refs/tags/${SWIFT_TAG}" \
-            -f sha="$NEW_SHA" 2>/dev/null \
-          || gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${SWIFT_TAG}" \
-            -X PATCH \
-            -f sha="$NEW_SHA" \
-            -F force=true
+          echo "SWIFT_SHA=$NEW_SHA" >> "$GITHUB_ENV"
 
+      # SPM resolves semver tags only, so the semver tag must point at the
+      # swift-releases commit whose Package.swift has the real URL and checksum.
+      - name: Tag the swift-releases commit with the semver tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          EXISTING=$(git ls-remote origin "refs/tags/$TAG" | cut -f1)
+          if [ -z "$EXISTING" ]; then
+            git push origin "$SWIFT_SHA:refs/tags/$TAG"
+          elif [ "$EXISTING" = "$SWIFT_SHA" ]; then
+            echo "Tag $TAG already points at $SWIFT_SHA"
+          else
+            echo "::error::Tag $TAG already exists at $EXISTING, not at the swift-releases commit $SWIFT_SHA. Check which commit SPM users resolve before moving it."
+            exit 1
+          fi
+
+      - name: Create GitHub Release and upload xcframework
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "MinigrafKit $TAG" \
+            --notes "Swift/iOS binding for minigraf $TAG."
+          gh release upload "$TAG" "MinigrafKit-${TAG}.xcframework.zip" \
+            --repo "$GITHUB_REPOSITORY"
