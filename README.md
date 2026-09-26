@@ -20,19 +20,24 @@ dependencies: [
 > Each semver tag `v<version>` points to a commit on the `swift-releases` branch. That commit
 > holds the `Package.swift` with the release's xcframework URL and checksum, plus the generated
 > Swift sources. The matching source commit on `main` is tagged `source-v<version>`.
-> Releases up to v2.0.1 were tagged differently; see
-> [Older releases](#older-releases) below.
+> Releases up to v2.0.0 were tagged differently; see [Older releases](#older-releases) below.
+> The `v2.0.1` tag was moved to its `swift-releases` commit after the fact, so it resolves normally
+> but has no `source-v2.0.1` tag.
 
 ### Older releases
 
 Before the tagging fix, the release workflow put the semver tag on the source commit, whose
-`Package.swift` has a placeholder checksum and no generated sources. Those tags do not resolve.
-For those versions, the working manifest is on the `swift-v<version>` tag instead, which SPM
-cannot resolve by version. Pin the `swift-releases` branch or a specific revision instead:
+`Package.swift` has a placeholder checksum and no generated sources. The tags `v2.0.0` and
+earlier do not resolve. For those versions, the working manifest is on the `swift-v<version>`
+tag, which SPM cannot resolve by version. Pin that tag's commit instead, for example:
 
 ```swift
-.package(url: "https://github.com/project-minigraf/minigraf-swift", branch: "swift-releases")
+// swift-v2.0.0
+.package(url: "https://github.com/project-minigraf/minigraf-swift", revision: "1307a095c1725d2813abbbdcf17557311d517d24")
 ```
+
+Use `git ls-remote --tags https://github.com/project-minigraf/minigraf-swift 'swift-v*'` to
+find the commit for another version. New projects should use 2.0.1 or later.
 
 Requires iOS 16+.
 
