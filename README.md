@@ -13,12 +13,26 @@ Or add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "1.2.0")
+    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "2.0.1")
 ]
 ```
 
-> SPM resolves via the `swift-v<version>` tag which points to the `swift-releases` branch
-> containing the updated `Package.swift` and generated Swift sources.
+> Each semver tag `v<version>` points to a commit on the `swift-releases` branch. That commit
+> holds the `Package.swift` with the release's xcframework URL and checksum, plus the generated
+> Swift sources. The matching source commit on `main` is tagged `source-v<version>`.
+> Releases up to v2.0.1 were tagged differently; see
+> [Older releases](#older-releases) below.
+
+### Older releases
+
+Before the tagging fix, the release workflow put the semver tag on the source commit, whose
+`Package.swift` has a placeholder checksum and no generated sources. Those tags do not resolve.
+For those versions, the working manifest is on the `swift-v<version>` tag instead, which SPM
+cannot resolve by version. Pin the `swift-releases` branch or a specific revision instead:
+
+```swift
+.package(url: "https://github.com/project-minigraf/minigraf-swift", branch: "swift-releases")
+```
 
 Requires iOS 16+.
 
@@ -51,7 +65,8 @@ cargo run --bin uniffi-bindgen -- generate \
 This repo receives a `core-release` repository_dispatch from the minigraf monorepo
 cascade whenever a new version of the `minigraf` core crate is published. The release
 workflow pins the new version, builds the xcframework for iOS device and simulator,
-zips it, creates a GitHub Release, and updates `Package.swift` on the `swift-releases` branch.
+zips it, updates `Package.swift` on the `swift-releases` branch, tags that commit with the
+semver tag SPM resolves, and creates a GitHub Release with the xcframework.
 
 ## License
 
