@@ -96,6 +96,8 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
+          # Parent commit (= main) so git can verify the main push is a fast-forward.
+          fetch-depth: 2
 
       - name: Push source tag, fast-forward main, delete release branch
         env:
