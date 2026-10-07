@@ -125,6 +125,16 @@ do {
     check(errorText { _ = try MiniGrafLogWriter.create(path: out, options: OpenOptions()) }.hasPrefix("[STG-043]"), "STG-043")
 }
 
+// #322: walCheckpointNever leaves the WAL when the handle closes.
+do {
+    let p = path("never.graph")
+    do {
+        let db = try MiniGrafDb.openWithOptions(path: p, options: OpenOptions(walCheckpointThreshold: walCheckpointNever))
+        _ = try db.execute(datalog: "(transact [[:a :n 1]])")
+    }
+    check(FileManager.default.fileExists(atPath: p + ".wal"), "WAL kept on close")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")

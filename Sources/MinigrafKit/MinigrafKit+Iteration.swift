@@ -35,3 +35,7 @@ extension MiniGrafError {
 
 /// `validTo` of a fact that is valid forever.
 public let validTimeForever: Int64 = Int64.max
+
+/// `walCheckpointThreshold` that never checkpoints: no automatic checkpoint and
+/// none when the handle closes. Call `checkpoint()` yourself.
+public let walCheckpointNever: Int64 = Int64.max
