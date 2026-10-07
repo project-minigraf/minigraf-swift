@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v3]
   pull_request:
   workflow_call:
     inputs:
@@ -34,3 +34,31 @@ jobs:
           targets: aarch64-apple-ios-sim
       - name: Build for iOS simulator
         run: cargo build --target aarch64-apple-ios-sim --release
+
+  # Compiles the generated Swift bindings with Sources/MinigrafKit and runs
+  # Tests/swift/main.swift against a macOS build of the shim.
+  swift-test:
+    name: Swift bindings test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build shim (release)
+        run: cargo build --release
+      - name: Generate Swift bindings
+        run: |
+          cargo run --release --bin uniffi-bindgen -- generate \
+            --library target/release/libminigraf_ffi.dylib \
+            --language swift \
+            --out-dir build/swift
+      - name: Compile and run Swift tests
+        run: |
+          swiftc -module-name MinigrafKit \
+            -I build/swift \
+            -Xcc -fmodule-map-file=build/swift/minigraf_ffiFFI.modulemap \
+            -L target/release -lminigraf_ffi \
+            build/swift/minigraf_ffi.swift Sources/MinigrafKit/*.swift Tests/swift/main.swift \
+            -o build/swift-test
+          DYLD_LIBRARY_PATH=target/release ./build/swift-test

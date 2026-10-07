@@ -51,6 +51,33 @@ let result = try db.execute(datalog: #"(transact [[:alice :name "Alice"]])"#)
 print(result)  // {"transacted":1}
 ```
 
+## Open options, cursors, the fact log and the log writer
+
+```swift
+import MinigrafKit
+
+// Read-only: shared lock, nothing written; writes throw MiniGrafError (API-014).
+let src = try MiniGrafDb.openWithOptions(path: oldPath, options: OpenOptions(readOnly: true, pageCacheSize: 4096))
+
+// A cursor's answer is fixed when it opens. Each batch is a JSON array of rows,
+// encoded like execute()'s "results".
+let cursor = try src.query(datalog: "(query [:find ?n :where [?e :name ?n]])")
+try cursor.forEachBatch(size: 1000) { batch in /* parse rows */ }
+
+// Copy every fact version, keeping tx and valid-time bounds, into a new file.
+let out = try MiniGrafLogWriter.create(path: newPath, options: OpenOptions())
+try src.factLog(filter: FactFilter()).forEachRecord { record in
+    if !record.attribute.hasPrefix(":secret/") { try out.append(record: record) }
+}
+try out.advanceTxCount(txCount: try src.currentTxCount())
+try out.finish()   // out.close() instead abandons the build and leaves no file
+```
+
+`appendBatch(records:)` appends many records per call. A record's value is a
+`MiniGrafValue` (`.text`, `.int64`, `.float64`, `.bool`, `.ref`, `.keyword`, `.null`);
+`validTimeForever` is the `validTo` of a fact valid forever. `MiniGrafError.message`
+starts with the error's code, such as `[API-015]`.
+
 ## Building from source
 
 Requires Rust stable toolchain with iOS targets and Xcode.
