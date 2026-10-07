@@ -118,8 +118,9 @@ pub struct OpenOptions {
     /// Open even when the filesystem cannot lock files. Default false.
     #[uniffi(default)]
     pub allow_unlocked: Option<bool>,
-    /// WAL entries before an automatic checkpoint. Default 1000; the maximum
-    /// value also suppresses the checkpoint on close.
+    /// WAL entries before an automatic checkpoint. Default 1000. The maximum
+    /// (i64::MAX, 9223372036854775807) means never: no automatic checkpoint
+    /// and no checkpoint when the handle closes; call `checkpoint()` yourself.
     #[uniffi(default)]
     pub wal_checkpoint_threshold: Option<i64>,
     /// Facts a recursive rule may derive per iteration. Default 1,000,000.
@@ -146,7 +147,14 @@ impl OpenOptions {
             o = o.allow_unlocked(v);
         }
         if let Some(v) = self.wal_checkpoint_threshold {
-            o = o.wal_checkpoint_threshold(to_usize(v, "wal_checkpoint_threshold")?);
+            // i64::MAX stands for core's usize::MAX sentinel, which is out of
+            // reach of a signed count.
+            let n = if v == i64::MAX {
+                usize::MAX
+            } else {
+                to_usize(v, "wal_checkpoint_threshold")?
+            };
+            o = o.wal_checkpoint_threshold(n);
         }
         if let Some(v) = self.max_derived_facts {
             o = o.max_derived_facts(to_usize(v, "max_derived_facts")?);
@@ -865,6 +873,45 @@ mod tests {
             .query("(query [:find ?e :where [?e :n _]])".into())
             .expect("query");
         assert!(msg(err(cursor.next_batch(-1))).starts_with("[API-017]"));
+    }
+
+    #[test]
+    fn max_wal_checkpoint_threshold_suppresses_the_close_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("minigraf_ffi_never_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("db.graph");
+        let wal = dir.join("db.graph.wal");
+        let options = |threshold| OpenOptions {
+            wal_checkpoint_threshold: Some(threshold),
+            ..OpenOptions::default()
+        };
+
+        let db =
+            MiniGrafDb::open_with_options(path.to_str().expect("utf8").into(), options(i64::MAX))
+                .expect("open");
+        db.execute("(transact [[:a :n 1]])".into())
+            .expect("transact");
+        drop(db);
+        assert!(
+            wal.exists(),
+            "i64::MAX must suppress the close-time checkpoint"
+        );
+
+        // One below the maximum is an ordinary threshold: closing checkpoints.
+        let path2 = dir.join("db2.graph");
+        let wal2 = dir.join("db2.graph.wal");
+        let db = MiniGrafDb::open_with_options(
+            path2.to_str().expect("utf8").into(),
+            options(i64::MAX - 1),
+        )
+        .expect("open second");
+        db.execute("(transact [[:a :n 1]])".into())
+            .expect("transact");
+        assert!(wal2.exists(), "the write is in the WAL before close");
+        drop(db);
+        assert!(!wal2.exists(), "an ordinary threshold checkpoints on close");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
