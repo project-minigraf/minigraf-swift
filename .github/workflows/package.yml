@@ -1,0 +1,86 @@
+name: Package
+
+# Builds the xcframework zip exactly as the release publishes it, plus the
+# generated Swift sources the release commits to swift-releases, and uploads
+# both as dist-xcframework.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ''
+      version:
+        required: true
+        type: string
+
+jobs:
+  xcframework:
+    name: Build xcframework
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Build iOS device library
+        run: cargo build --target aarch64-apple-ios --release
+
+      - name: Build iOS simulator library
+        run: cargo build --target aarch64-apple-ios-sim --release
+
+      - name: Build iOS x86_64 simulator library
+        run: cargo build --target x86_64-apple-ios --release
+
+      - name: Create universal iOS simulator library
+        run: |
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libminigraf_ffi.a \
+            target/x86_64-apple-ios/release/libminigraf_ffi.a \
+            -output libminigraf_ffi_sim_universal.a
+
+      - name: Generate Swift bindings
+        run: |
+          mkdir -p generated
+          cargo run --bin uniffi-bindgen -- generate \
+            --library target/aarch64-apple-ios/release/libminigraf_ffi.a \
+            --language swift \
+            --out-dir generated/
+
+      # Clang finds a module in a header directory only through a file named
+      # module.modulemap. Under its generated name (minigraf_ffiFFI.modulemap)
+      # `canImport(minigraf_ffiFFI)` is false and minigraf_ffi.swift does not
+      # compile, which broke every release up to 2.0.8.
+      - name: Prepare headers for xcframework
+        run: |
+          mkdir -p includes
+          cp generated/*.h includes/
+          cp generated/minigraf_ffiFFI.modulemap includes/module.modulemap
+
+      - name: Assemble xcframework
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libminigraf_ffi.a \
+            -headers includes/ \
+            -library libminigraf_ffi_sim_universal.a \
+            -headers includes/ \
+            -output "MinigrafKit.xcframework"
+          mkdir -p dist/Sources
+          zip -qr "dist/MinigrafKit-v$VERSION.xcframework.zip" MinigrafKit.xcframework
+          # Only the Swift file goes into the MinigrafKit target; the header
+          # and the module map reach the compiler through the xcframework.
+          cp generated/*.swift dist/Sources/
+          ls -lR dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-xcframework
+          path: dist/
+          if-no-files-found: error
