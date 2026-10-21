@@ -26,8 +26,10 @@ jobs:
           token: ${{ secrets.MINIGRAF_RELEASE_TOKEN }}
 
       - id: ver
+        env:
+          V: ${{ github.event.client_payload.version || github.event.inputs.version }}
         run: |
-          V="${{ github.event.client_payload.version || github.event.inputs.version }}"
+          [[ "$V" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version '$V' is not v<semver>"; exit 1; }
           echo "tag=$V" >> "$GITHUB_OUTPUT"
           echo "semver=${V#v}" >> "$GITHUB_OUTPUT"
 
@@ -60,7 +62,8 @@ jobs:
       - name: Stamp the version in the README install snippet
         run: |
           sed -i 's|\(\.package(url: "https://github.com/project-minigraf/minigraf-swift", from: "\)[^"]*"|\1${{ steps.ver.outputs.semver }}"|' README.md
-          grep -n 'from: "${{ steps.ver.outputs.semver }}"' README.md
+          [ "$(grep -c 'minigraf-swift", from: "${{ steps.ver.outputs.semver }}")' README.md)" -eq 1 ] \
+            || { echo "::error::the README install snippet was not stamped"; exit 1; }
 
       # Push the pin commit to a throwaway branch only. The tag and main are
       # updated by the tag job, after the test job has passed on this commit.
@@ -144,7 +147,11 @@ jobs:
           name: dist-xcframework
           path: ${{ runner.temp }}/dist
 
-      - name: Compute checksum and update Package.swift
+      # A re-run after a partial publish must not move what is already public:
+      # once the semver tag exists, its Package.swift fixes the checksum, so
+      # only the same zip may be uploaded, and the branch and tag stay put.
+      - name: Check for an earlier publish of this version
+        id: earlier
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
           DIST: ${{ runner.temp }}/dist
@@ -152,12 +159,33 @@ jobs:
           ZIP="$DIST/MinigrafKit-${TAG}.xcframework.zip"
           [ -f "$ZIP" ] || { echo "::error::no $ZIP"; ls -R "$DIST"; exit 1; }
           CHECKSUM=$(sha256sum "$ZIP" | awk '{print $1}')
+          echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            git fetch --quiet origin "refs/tags/$TAG:refs/tags/$TAG"
+            PUBLISHED=$(git show "$TAG:Package.swift" | sed -n 's/.*checksum: "\([0-9a-f]*\)".*/\1/p')
+            if [ "$PUBLISHED" != "$CHECKSUM" ]; then
+              echo "::error::$TAG is already tagged with checksum $PUBLISHED, but the tested zip is $CHECKSUM. The tag is public; do not move it."
+              exit 1
+            fi
+            echo "::warning::$TAG is already tagged with this zip's checksum; only the release asset is (re)checked"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute checksum and update Package.swift
+        if: steps.earlier.outputs.tagged == 'false'
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          CHECKSUM: ${{ steps.earlier.outputs.checksum }}
+        run: |
           URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/MinigrafKit-${TAG}.xcframework.zip"
           perl -0pi -e "s|url: \"[^\"]*\",(\s*)checksum: \"[^\"]*\"|url: \"${URL}\",\1checksum: \"${CHECKSUM}\"|" Package.swift
           grep -q "checksum: \"${CHECKSUM}\"" Package.swift || { echo "::error::Package.swift was not updated"; exit 1; }
           grep -n 'url:\|checksum:' Package.swift
 
       - name: Commit Package.swift and Swift sources to swift-releases branch
+        if: steps.earlier.outputs.tagged == 'false'
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
           DIST: ${{ runner.temp }}/dist
@@ -198,6 +226,7 @@ jobs:
       # SPM resolves semver tags only, so the semver tag must point at the
       # swift-releases commit whose Package.swift has the real URL and checksum.
       - name: Tag the swift-releases commit with the semver tag
+        if: steps.earlier.outputs.tagged == 'false'
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
@@ -224,6 +253,8 @@ jobs:
               --title "MinigrafKit $TAG" \
               --notes "Swift/iOS binding for minigraf $TAG."
           fi
+          # The zip matches the tagged checksum (checked above), so replacing an
+          # asset left by a partial upload is safe.
           gh release upload "$TAG" "$DIST/MinigrafKit-${TAG}.xcframework.zip" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
