@@ -1,0 +1,70 @@
+name: Verify published
+
+# Resolves MinigrafKit <version> with Swift Package Manager into an empty app
+# package, as a user would, and runs the consumer test on an iOS simulator. A
+# failure means a broken release is public: the run fails and an issue
+# labelled release-broken is opened (or commented on, if one is open for this
+# version).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: 'Ref whose consumer-test/ to run (release.yml passes the source tag)'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published version (e.g. 2.0.9)'
+        required: true
+        type: string
+      ref:
+        description: 'Ref whose consumer-test/ to run (default: the branch dispatched from)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    name: Consumer test from the release (iOS simulator)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Run consumer test
+        run: bash consumer-test/run.sh registry ${{ inputs.version }}
+
+  report:
+    name: Report broken release
+    needs: verify
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open or update the release-broken issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create release-broken --repo "$REPO" --color B60205 \
+            --description "A published release does not install or run" --force
+          TITLE="v$VERSION published but unusable: consumer test failed (SPM)"
+          BODY="The consumer test failed against MinigrafKit $VERSION resolved with Swift Package Manager. Run: $RUN_URL"
+          NUMBER=$(gh issue list --repo "$REPO" --label release-broken --state open \
+            --search "\"v$VERSION published\" in:title" --json number -q '.[0].number')
+          if [ -n "$NUMBER" ]; then
+            gh issue comment "$NUMBER" --repo "$REPO" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "$TITLE" --label bug --label release-broken --body "$BODY"
+          fi

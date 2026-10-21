@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ''
+      version:
+        description: 'Version in the xcframework zip name (release.yml passes the release version)'
+        required: false
+        type: string
+        default: '0.0.0-ci'
 
 jobs:
   rust-test:
@@ -22,18 +27,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
 
-  ios-build:
-    name: iOS simulator build smoke test
+  # Builds the xcframework zip and the generated Swift sources as the release
+  # publishes them.
+  package:
+    name: Package
+    uses: ./.github/workflows/package.yml
+    with:
+      ref: ${{ inputs.ref }}
+      version: ${{ inputs.version || '0.0.0-ci' }}
+
+  # An SPM app package depending on MinigrafKit, assembled as swift-releases
+  # will be, runs the README quick start and the consumer contract on an iOS
+  # simulator.
+  consumer:
+    name: Consumer test (iOS simulator)
+    needs: package
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
         with:
-          targets: aarch64-apple-ios-sim
-      - name: Build for iOS simulator
-        run: cargo build --target aarch64-apple-ios-sim --release
+          name: dist-xcframework
+          path: dist-xcframework
+      - name: Run consumer test
+        run: bash consumer-test/run.sh local dist-xcframework ${{ inputs.version || '0.0.0-ci' }}
 
   # Compiles the generated Swift bindings with Sources/MinigrafKit and runs
   # Tests/swift/main.swift against a macOS build of the shim.
@@ -62,3 +81,12 @@ jobs:
             build/swift/minigraf_ffi.swift Sources/MinigrafKit/*.swift Tests/swift/main.swift \
             -o build/swift-test
           DYLD_LIBRARY_PATH=target/release ./build/swift-test
+
+  readme-sync:
+    name: README quick start matches the consumer test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: python3 -I consumer-test/readme_sync.py README.md consumer-test/App/Tests/ConsumerTests/QuickstartTests.swift
