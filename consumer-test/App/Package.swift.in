@@ -1,0 +1,23 @@
+// swift-tools-version: 5.9
+// run.sh writes Package.swift from this file, with the dependency for its mode:
+// a path to the locally assembled package, or the published release.
+import PackageDescription
+
+let package = Package(
+    name: "Consumer",
+    platforms: [.iOS(.v16)],
+    products: [.library(name: "Consumer", targets: ["Consumer"])],
+    dependencies: [
+        @DEPENDENCY@
+    ],
+    targets: [
+        .target(
+            name: "Consumer",
+            dependencies: [.product(name: "MinigrafKit", package: "minigraf-swift")]
+        ),
+        .testTarget(
+            name: "ConsumerTests",
+            dependencies: ["Consumer", .product(name: "MinigrafKit", package: "minigraf-swift")]
+        ),
+    ]
+)
