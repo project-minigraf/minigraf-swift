@@ -126,12 +126,17 @@ pub struct OpenOptions {
     /// Facts a recursive rule may derive per iteration. Default 1,000,000.
     #[uniffi(default)]
     pub max_derived_facts: Option<i64>,
-    /// Rows a query may return. Default 1,000,000.
+    /// Deprecated alias of `max_derived_facts`; the lower of the two applies.
     #[uniffi(default)]
     pub max_results: Option<i64>,
     /// WAL durability. Default `Full`.
     #[uniffi(default)]
     pub synchronous: Option<SyncMode>,
+    /// The most bytes one query may hold; a query that would hold more fails
+    /// with QRY-012. The maximum (i64::MAX, 9223372036854775807) means no
+    /// limit, the default.
+    #[uniffi(default)]
+    pub query_memory_limit: Option<i64>,
 }
 
 impl OpenOptions {
@@ -160,13 +165,26 @@ impl OpenOptions {
             o = o.max_derived_facts(to_usize(v, "max_derived_facts")?);
         }
         if let Some(v) = self.max_results {
-            o = o.max_results(to_usize(v, "max_results")?);
+            #[allow(deprecated)]
+            {
+                o = o.max_results(to_usize(v, "max_results")?);
+            }
         }
         if let Some(v) = self.synchronous {
             o = o.synchronous(match v {
                 SyncMode::Full => minigraf::SyncMode::Full,
                 SyncMode::Normal => minigraf::SyncMode::Normal,
             });
+        }
+        if let Some(v) = self.query_memory_limit {
+            // i64::MAX stands for core's usize::MAX (no limit), as for
+            // wal_checkpoint_threshold.
+            let n = if v == i64::MAX {
+                usize::MAX
+            } else {
+                to_usize(v, "query_memory_limit")?
+            };
+            o = o.query_memory_limit(n);
         }
         Ok(o)
     }
@@ -717,7 +735,7 @@ mod tests {
 
     #[test]
     fn value_to_json_ref() {
-        let id = minigraf::EntityId::new_v4();
+        let id = minigraf::EntityId::from_u128(0x6f1c_2a3b_4d5e_4f60_8172_839a_b4c5_d6e7);
         let j = value_to_json(&Value::Ref(id));
         assert_eq!(j, serde_json::Value::String(id.to_string()));
     }
@@ -832,7 +850,7 @@ mod tests {
 
     #[test]
     fn value_round_trips_through_core() {
-        let id = minigraf::EntityId::new_v4();
+        let id = minigraf::EntityId::from_u128(0x6f1c_2a3b_4d5e_4f60_8172_839a_b4c5_d6e7);
         for v in [
             Value::String("s".into()),
             Value::Integer(-3),
@@ -911,6 +929,40 @@ mod tests {
         assert!(wal2.exists(), "the write is in the WAL before close");
         drop(db);
         assert!(!wal2.exists(), "an ordinary threshold checkpoints on close");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_memory_limit_is_qry_012() {
+        let options = |limit| OpenOptions {
+            query_memory_limit: Some(limit),
+            ..OpenOptions::default()
+        };
+        assert!(msg(err(options(-1).to_core())).starts_with("[API-017]"));
+
+        let dir = std::env::temp_dir().join(format!("minigraf_ffi_qml_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A cartesian product holds one side in full.
+        let product = "(query [:find ?a ?b :where [?a :n _] [?b :m _]])";
+        for (name, limit, fails) in [("small", 64, true), ("max", i64::MAX, false)] {
+            let path = dir.join(format!("{name}.graph"));
+            let db =
+                MiniGrafDb::open_with_options(path.to_str().expect("utf8").into(), options(limit))
+                    .expect("open");
+            db.execute("(transact [[:a :n 1] [:b :m 2]])".into())
+                .expect("transact");
+            let r = db.execute(product.into());
+            if fails {
+                let e = err(r);
+                assert!(matches!(e, MiniGrafError::Query { .. }), "a query error");
+                assert!(msg(e).starts_with("[QRY-012]"));
+                let cursor = db.query(product.into()).expect("query");
+                assert!(msg(err(cursor.next_batch(10))).starts_with("[QRY-012]"));
+            } else {
+                r.expect("no limit");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

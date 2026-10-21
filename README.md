@@ -82,6 +82,13 @@ try out.finish()   // out.close() instead abandons the build and leaves no file
 `validTimeForever` is the `validTo` of a fact valid forever. `MiniGrafError.message`
 starts with the error's code, such as `[API-015]`.
 
+`OpenOptions(queryMemoryLimit: bytes)` caps the bytes one query may hold, counted per
+entry by the operators that keep state (join build sides, negation and `or` tables,
+distinct sets, aggregate groups, window rows, rule-derived facts). A query that would hold
+more throws `MiniGrafError.Query` with QRY-012 and frees what it held. The default, and
+`Int64.max`, is no limit. Rows a cursor returns are not counted, so read a large answer
+with `query(datalog:)`.
+
 ## Building from source
 
 Requires Rust stable toolchain with iOS targets and Xcode.

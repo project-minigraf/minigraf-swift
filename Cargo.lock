@@ -439,8 +439,8 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "minigraf"
-version = "2.0.3"
-source = "git+https://github.com/project-minigraf/minigraf?rev=97cd4a2a85301ea3478250dd654139d45a1f7cd0#97cd4a2a85301ea3478250dd654139d45a1f7cd0"
+version = "2.0.5"
+source = "git+https://github.com/project-minigraf/minigraf?rev=df7282f1f3ad17628d33fa5488730201313ac268#df7282f1f3ad17628d33fa5488730201313ac268"
 dependencies = [
  "anyhow",
  "chrono",
@@ -967,7 +967,6 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
- "getrandom",
  "js-sys",
  "serde_core",
  "sha1_smol",

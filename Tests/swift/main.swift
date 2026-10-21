@@ -135,6 +135,21 @@ do {
     check(FileManager.default.fileExists(atPath: p + ".wal"), "WAL kept on close")
 }
 
+// #549: a query that would hold more than queryMemoryLimit bytes throws QRY-012.
+do {
+    // A cartesian product holds one side in full.
+    let product = "(query [:find ?a ?b :where [?a :n _] [?b :m _]])"
+    let small = try MiniGrafDb.openWithOptions(path: path("small.graph"), options: OpenOptions(queryMemoryLimit: 64))
+    _ = try small.execute(datalog: "(transact [[:a :n 1] [:b :m 2]])")
+    var isQuery = false
+    do { _ = try small.execute(datalog: product) } catch MiniGrafError.Query { isQuery = true }
+    check(isQuery, "QRY-012 is a query error")
+    check(errorText { _ = try small.execute(datalog: product) }.hasPrefix("[QRY-012]"), "QRY-012")
+    let max = try MiniGrafDb.openWithOptions(path: path("max.graph"), options: OpenOptions(queryMemoryLimit: Int64.max))
+    _ = try max.execute(datalog: "(transact [[:a :n 1] [:b :m 2]])")
+    check(errorText { _ = try max.execute(datalog: product) } == "no error", "Int64.max is no limit")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")
