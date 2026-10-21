@@ -13,7 +13,7 @@ Or add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "2.0.1")
+    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "2.0.8")
 ]
 ```
 
@@ -37,7 +37,11 @@ tag, which SPM cannot resolve by version. Pin that tag's commit instead, for exa
 ```
 
 Use `git ls-remote --tags https://github.com/project-minigraf/minigraf-swift 'swift-v*'` to
-find the commit for another version. New projects should use 2.0.1 or later.
+find the commit for another version.
+
+No release up to and including v2.0.8 compiles: its xcframework names the C module map
+`minigraf_ffiFFI.modulemap` instead of `module.modulemap`, so the generated Swift cannot import
+the FFI module ("cannot find type 'RustBuffer' in scope"). Use v2.0.9 or later.
 
 Requires iOS 16+.
 
