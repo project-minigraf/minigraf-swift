@@ -204,6 +204,25 @@ do {
     check(errorText { _ = try pq.execute(["n": MiniGrafBindValue.txCount(value: 1)]) }.hasPrefix("[API-024]"), "API-024")
     check(errorText { _ = try db.prepare(datalog: "(query [:find ?v :where [?e $a ?v]])") }.hasPrefix("[API-023]"), "API-023")
     check(errorText { _ = try pq.execute(["n": MiniGrafBindValue.txCount(value: -1)]) }.hasPrefix("[API-017]"), "API-017")
+
+    // #316: sets.
+    let member = try db.prepare(datalog: "(query [:find ?e :where [?e :n ?n] [(in? ?n $s)]])")
+    check(rows(try member.execute(["s": Set([1, 3])])).count == 2, "a Swift Set binds")
+    check(rows(try member.execute(["s": Set<Int64>()])).isEmpty, "an empty set binds")
+    check(rows(try member.execute(["s": MiniGrafValue.set(value: [.int64(value: 2), .int64(value: 2)])])).count == 1, "a typed set binds")
+    _ = try db.execute(datalog: #"(transact [[:a :tags #{1 :k "x"}]])"#)
+    let equal = try db.prepare(datalog: "(query [:find ?e :where [?e :tags $s]])")
+    let tags: Set<MiniGrafValue> = [.int64(value: 1), .text(value: "x"), .keyword(value: ":k")]
+    check(rows(try equal.execute(["s": tags])).count == 1, "a set equals a stored set")
+    check(rows(try equal.execute(["s": Set<MiniGrafValue>([.int64(value: 1), .text(value: "x"), .text(value: ":k")])])).isEmpty, "a string is no keyword")
+    let out = rows(try db.execute(datalog: "(query [:find ?t :where [:a :tags ?t]])"))
+    check((out.first?.first as? [Any])?.count == 3, "a set is a JSON array")
+    var records: [FactRecord] = []
+    try db.factLog(filter: FactFilter(attributes: [":tags"])).forEachRecord(batchSize: 10) { records.append($0) }
+    check(records.first?.value == .set(value: [.text(value: "x"), .int64(value: 1), .keyword(value: ":k")]), "a fact record holds the set")
+    let refs = try db.prepare(datalog: "(query [:find ?x :where [$e :n ?x] [(in? $e $s)]])")
+    check(rows(try refs.execute(["e": uuid, "s": Set([uuid])])).count == 1, "a UUID element is a ref")
+    check(errorText { _ = try member.execute(["s": Set<MiniGrafValue>([.set(value: [])])]) }.hasPrefix("[API-021]"), "API-021")
 }
 
 try? FileManager.default.removeItem(at: dir)
