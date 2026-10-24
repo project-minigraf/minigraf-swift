@@ -27,7 +27,7 @@ extension MiniGrafError {
     /// The error's text, starting with its code, such as `[API-015]`.
     public var message: String {
         switch self {
-        case .Storage(let msg), .Query(let msg), .Parse(let msg), .Other(let msg):
+        case .Storage(let msg), .Query(let msg), .Parse(let msg), .Other(let msg), .Api(let msg):
             return msg
         }
     }

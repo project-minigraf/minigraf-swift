@@ -37,6 +37,17 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(r.first?.first as? String, "Bob", "file-backed database lost its data on reopen")
     }
 
+    func testPreparedQuery() throws {
+        let db = try MiniGrafDb.openInMemory()
+        _ = try db.execute(datalog: #"(transact [[:alice :name "Alice"] [:bob :name "Bob"]])"#)
+        let pq = try db.prepare(datalog: "(query [:find ?n :where [?e :name $name] [?e :name ?n]])")
+        for name in ["Alice", "Bob"] {
+            XCTAssertEqual(try rows(pq.execute(["name": name])).first?.first as? String, name)
+        }
+        let typed = try rows(pq.execute(["name": MiniGrafValue.text(value: "Alice")]))
+        XCTAssertEqual(typed.first?.first as? String, "Alice", "a typed value binds")
+    }
+
     func testErrorType() throws {
         let db = try MiniGrafDb.openInMemory()
         XCTAssertThrowsError(try db.execute(datalog: "(nosuchcommand [])")) { error in

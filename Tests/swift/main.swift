@@ -150,6 +150,62 @@ do {
     check(errorText { _ = try max.execute(datalog: product) } == "no error", "Int64.max is no limit")
 }
 
+// #181: prepared queries.
+do {
+    let db = try MiniGrafDb.openInMemory()
+    _ = try db.execute(datalog: #"(transact [[:a :n 1] [:b :n 2] [:c :n 3] [:a :s "x"] [:a :f 2.5] [:a :w 2.0] [:a :t true] [:a :k :kw] [:a :z nil]])"#)
+    func rows(_ json: String) -> [[Any]] {
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+        return object?["results"] as? [[Any]] ?? []
+    }
+    let pq = try db.prepare(datalog: "(query [:find ?x :where [?e :n $n] [?e :n ?x]])")
+    for n in 1...3 {
+        let r = rows(try pq.execute(["n": n]))
+        check(r.count == 1 && (r[0][0] as? NSNumber)?.intValue == n, "prepared row for \(n)")
+    }
+    check(rows(try pq.execute(["n": 9])).isEmpty, "no row for 9")
+
+    let plain: [(String, (any MinigrafBindable)?)] = [
+        (":n", Int64(1)), (":n", Int32(1)), (":s", "x"), (":f", 2.5), (":f", Float(2.5)),
+        (":w", 2.0), (":t", true), (":z", nil),
+    ]
+    for (attr, value) in plain {
+        let q = try db.prepare(datalog: "(query [:find ?e :where [?e \(attr) $v]])")
+        check(rows(try q.execute(["v": value])).count == 1, "plain value for \(attr)")
+    }
+
+    let entity = rows(try db.execute(datalog: #"(query [:find ?e :where [?e :s "x"]])"#))[0][0] as! String
+    let uuid = UUID(uuidString: entity)!
+    check(rows(try db.prepare(datalog: "(query [:find ?x :where [$e :n ?x]])").execute(["e": uuid])).count == 1, "UUID in an entity slot")
+    _ = try db.execute(datalog: "(transact [[:b :friend #uuid \"\(entity)\"]])")
+    check(rows(try db.prepare(datalog: "(query [:find ?x :where [?x :friend $f]])").execute(["f": uuid])).count == 1, "UUID in a value slot")
+
+    let typed: [(String, any MinigrafBindable)] = [
+        ("(query [:find ?e :where [?e :k $v]])", MiniGrafValue.keyword(value: ":kw")),
+        ("(query [:find ?x :where [$v :n ?x]])", MiniGrafValue.ref(value: entity)),
+        ("(query [:find ?x :as-of $v :where [?e :n ?x]])", MiniGrafBindValue.txCount(value: 1)),
+        ("(query [:find ?x :as-of $v :where [?e :n ?x]])", MiniGrafBindValue.timestamp(value: Int64.max)),
+        ("(query [:find ?x :valid-at $v :where [:a :n ?x]])", MiniGrafBindValue.anyValidTime),
+    ]
+    for (q, value) in typed {
+        check(!rows(try db.prepare(datalog: q).execute(["v": value])).isEmpty, "typed value in \(q)")
+    }
+
+    var seen = 0
+    try pq.query(["n": 2]).forEachBatch(size: 1) { batch in
+        seen += ((try JSONSerialization.jsonObject(with: Data(batch.utf8))) as? [[Any]])?.count ?? 0
+    }
+    check(seen == 1, "prepared cursor")
+
+    var isApi = false
+    do { _ = try pq.execute([:]) } catch MiniGrafError.Api { isApi = true }
+    check(isApi, "a missing slot is an API error")
+    check(errorText { _ = try pq.execute([:]) }.hasPrefix("[API-022]"), "API-022")
+    check(errorText { _ = try pq.execute(["n": MiniGrafBindValue.txCount(value: 1)]) }.hasPrefix("[API-024]"), "API-024")
+    check(errorText { _ = try db.prepare(datalog: "(query [:find ?v :where [?e $a ?v]])") }.hasPrefix("[API-023]"), "API-023")
+    check(errorText { _ = try pq.execute(["n": MiniGrafBindValue.txCount(value: -1)]) }.hasPrefix("[API-017]"), "API-017")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")

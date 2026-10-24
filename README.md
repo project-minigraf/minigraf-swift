@@ -89,6 +89,29 @@ more throws `MiniGrafError.Query` with QRY-012 and frees what it held. The defau
 `Int64.max`, is no limit. Rows a cursor returns are not counted, so read a large answer
 with `query(datalog:)`.
 
+## Prepared queries
+
+`db.prepare(datalog:)` parses a query once; run it with its `$slots` bound (names
+without the `$`). Each run reads the database as it is then, and a prepared query keeps
+its database open until both are released.
+
+```swift
+let pq = try db.prepare(datalog: "(query [:find ?n :where [?e :age $age] [?e :name ?n]])")
+let thirty = try pq.execute(["age": 30])
+try pq.query(["age": 40]).forEachBatch { batch in /* JSON rows */ }
+```
+
+`Bool`, `Int`/`Int32`/`Int64`, `Double`/`Float`, `String`, `nil` (`Null`) and `UUID`
+(an entity, which also fits value slots as a ref) bind as they are: they conform to
+`MinigrafBindable`. For the other kinds pass a `MiniGrafValue` (`.keyword`, `.ref`, a
+whole-number `.float64`) or a `MiniGrafBindValue` (`.entity`, `.txCount` or `.timestamp`
+for `:as-of`, `.anyValidTime` for `:valid-at`). A missing slot throws
+`MiniGrafError.Api` with `[API-022]`, a slot in an attribute position `[API-023]`, and a
+value of the wrong kind `[API-024]`.
+
+`MiniGrafError` is `.Parse`, `.Query`, `.Storage`, `.Api` (a bad argument, a closed
+object, a bind mistake) or `.Other`.
+
 ## Building from source
 
 Requires Rust stable toolchain with iOS targets and Xcode.

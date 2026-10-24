@@ -12,6 +12,7 @@
 )]
 
 use minigraf::{QueryResult, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 uniffi::setup_scaffolding!();
@@ -28,6 +29,10 @@ pub enum MiniGrafError {
     Parse { msg: String },
     #[error("unknown error: {msg}")]
     Other { msg: String },
+    /// A call the API refuses: a bad argument, a closed object, a bind
+    /// mistake. The message starts with its `API-` code.
+    #[error("API error: {msg}")]
+    Api { msg: String },
 }
 
 // ─── minigraf::MinigrafError → MiniGrafError conversion ──────────────────────
@@ -41,9 +46,8 @@ impl From<minigraf::MinigrafError> for MiniGrafError {
                 MiniGrafError::Storage { msg }
             }
             minigraf::ErrorCategory::Query => MiniGrafError::Query { msg },
-            minigraf::ErrorCategory::Api | minigraf::ErrorCategory::Internal | _ => {
-                MiniGrafError::Other { msg }
-            }
+            minigraf::ErrorCategory::Api => MiniGrafError::Api { msg },
+            minigraf::ErrorCategory::Internal | _ => MiniGrafError::Other { msg },
         }
     }
 }
@@ -57,6 +61,7 @@ impl MiniGrafError {
             MiniGrafError::Query { msg } => MiniGrafError::Query { msg: suffix(msg) },
             MiniGrafError::Parse { msg } => MiniGrafError::Parse { msg: suffix(msg) },
             MiniGrafError::Other { msg } => MiniGrafError::Other { msg: suffix(msg) },
+            MiniGrafError::Api { msg } => MiniGrafError::Api { msg: suffix(msg) },
         }
     }
 }
@@ -354,6 +359,61 @@ impl FactFilter {
     }
 }
 
+// ─── Bind values ─────────────────────────────────────────────────────────────
+
+/// The value of one `$slot` of a prepared query.
+///
+/// `Value` fills an entity position with a `Ref`, and a value, expression or
+/// rule-argument position. `Entity` fills an entity position, and the others
+/// as a `Ref`. `TxCount` and `Timestamp` fill `:as-of`; `Timestamp` and
+/// `AnyValidTime` fill `:valid-at`. A bind value of the wrong kind for its
+/// slot is API-024.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum MiniGrafBindValue {
+    Value {
+        value: MiniGrafValue,
+    },
+    /// An entity UUID string.
+    Entity {
+        uuid: String,
+    },
+    /// The counter `:as-of N` compares against; negative is API-017.
+    TxCount {
+        value: i64,
+    },
+    /// Unix milliseconds.
+    Timestamp {
+        value: i64,
+    },
+    AnyValidTime,
+}
+
+impl MiniGrafBindValue {
+    fn to_core(&self) -> Result<minigraf::BindValue, MiniGrafError> {
+        Ok(match self {
+            MiniGrafBindValue::Value { value } => minigraf::BindValue::Val(value.to_core()?),
+            MiniGrafBindValue::Entity { uuid } => {
+                minigraf::BindValue::Entity(parse_uuid(uuid, "entity")?)
+            }
+            MiniGrafBindValue::TxCount { value } => {
+                minigraf::BindValue::TxCount(to_u64(*value, "tx count")?)
+            }
+            MiniGrafBindValue::Timestamp { value } => minigraf::BindValue::Timestamp(*value),
+            MiniGrafBindValue::AnyValidTime => minigraf::BindValue::AnyValidTime,
+        })
+    }
+}
+
+/// `bindings` as core bind values, named without their `$`.
+fn core_bindings(
+    bindings: &HashMap<String, MiniGrafBindValue>,
+) -> Result<Vec<(&str, minigraf::BindValue)>, MiniGrafError> {
+    bindings
+        .iter()
+        .map(|(name, value)| Ok((name.as_str(), value.to_core()?)))
+        .collect()
+}
+
 // ─── MiniGrafDb ──────────────────────────────────────────────────────────────
 
 #[derive(uniffi::Object)]
@@ -423,6 +483,17 @@ impl MiniGrafDb {
         }))
     }
 
+    /// Parse and validate a `(query ...)` once, for running many times with
+    /// different bind values in its `$name` slots. A transact, retract or
+    /// rule is API-005/006/007; a slot in an attribute position is API-023.
+    pub fn prepare(&self, datalog: String) -> Result<Arc<MiniGrafPreparedQuery>, MiniGrafError> {
+        let inner = lock(&self.inner)?.prepare(&datalog)?;
+        Ok(Arc::new(MiniGrafPreparedQuery {
+            _db: self.inner.clone(),
+            inner,
+        }))
+    }
+
     /// The transaction counter that `:as-of N` compares against.
     pub fn current_tx_count(&self) -> Result<i64, MiniGrafError> {
         Ok(from_u64(lock(&self.inner)?.current_tx_count()))
@@ -436,6 +507,46 @@ impl MiniGrafDb {
             })?
             .checkpoint()
             .map_err(MiniGrafError::from)
+    }
+}
+
+// ─── MiniGrafPreparedQuery ───────────────────────────────────────────────────
+
+/// A query parsed once by `MiniGrafDb.prepare`, run with bind values. It
+/// keeps its database open until both are freed, and each run reads the
+/// database as it is then.
+#[derive(uniffi::Object)]
+pub struct MiniGrafPreparedQuery {
+    /// Keeps the database (and its close-time checkpoint) alive.
+    _db: Arc<Mutex<minigraf::Minigraf>>,
+    inner: minigraf::PreparedQuery,
+}
+
+#[uniffi::export]
+impl MiniGrafPreparedQuery {
+    /// Run the query with `bindings` (slot name without its `$` to bind
+    /// value) and return its result as JSON, encoded like
+    /// `MiniGrafDb.execute`. Names the query does not use are ignored. A
+    /// missing slot is API-022.
+    pub fn execute(
+        &self,
+        bindings: HashMap<String, MiniGrafBindValue>,
+    ) -> Result<String, MiniGrafError> {
+        let result = self.inner.execute(&core_bindings(&bindings)?)?;
+        Ok(query_result_to_json(result))
+    }
+
+    /// Run the query with `bindings` and return a cursor over its rows. The
+    /// answer is fixed when the cursor opens.
+    pub fn query(
+        &self,
+        bindings: HashMap<String, MiniGrafBindValue>,
+    ) -> Result<Arc<MiniGrafCursor>, MiniGrafError> {
+        let cursor = self.inner.query(&core_bindings(&bindings)?)?;
+        Ok(Arc::new(MiniGrafCursor {
+            vars: cursor.vars().to_vec(),
+            inner: Mutex::new(Some(cursor)),
+        }))
     }
 }
 
@@ -844,6 +955,7 @@ mod tests {
             MiniGrafError::Storage { msg }
             | MiniGrafError::Query { msg }
             | MiniGrafError::Parse { msg }
+            | MiniGrafError::Api { msg }
             | MiniGrafError::Other { msg } => msg,
         }
     }
@@ -1050,5 +1162,215 @@ mod tests {
     fn checkpoint_in_memory_succeeds() {
         let db = MiniGrafDb::open_in_memory().expect("open");
         db.checkpoint().expect("checkpoint on in-memory db");
+    }
+
+    // ─── Prepared queries (#181) ─────────────────────────────────────────
+
+    fn binds(pairs: &[(&str, MiniGrafBindValue)]) -> HashMap<String, MiniGrafBindValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn int(n: i64) -> MiniGrafBindValue {
+        MiniGrafBindValue::Value {
+            value: MiniGrafValue::Int64 { value: n },
+        }
+    }
+
+    fn result_rows(json: &str) -> usize {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        v["results"].as_array().expect("results").len()
+    }
+
+    fn prepared_db() -> Arc<MiniGrafDb> {
+        let db = MiniGrafDb::open_in_memory().expect("open");
+        db.execute(
+            r#"(transact [[:a :n 1] [:b :n 2] [:c :n 3]
+                          [:a :s "x"] [:a :f 2.5] [:a :t true] [:a :k :kw] [:a :z nil]])"#
+                .into(),
+        )
+        .expect("transact");
+        db
+    }
+
+    #[test]
+    fn prepared_query_runs_again_with_new_bindings() {
+        let db = prepared_db();
+        let pq = db
+            .prepare("(query [:find ?e :where [?e :n $n]])".into())
+            .expect("prepare");
+        for n in 1..=3 {
+            let r = pq.execute(binds(&[("n", int(n))])).expect("execute");
+            assert_eq!(result_rows(&r), 1, "one entity per value");
+        }
+        let r = pq.execute(binds(&[("n", int(9))])).expect("execute");
+        assert_eq!(result_rows(&r), 0, "no entity has 9");
+    }
+
+    #[test]
+    fn every_bind_value_variant_binds() {
+        let db = prepared_db();
+        let a = minigraf::EntityId::new_v5(&minigraf::EntityId::NAMESPACE_OID, b":a").to_string();
+        let value = |value| MiniGrafBindValue::Value { value };
+        for (q, bind) in [
+            ("(query [:find ?e :where [?e :n $v]])", int(1)),
+            (
+                "(query [:find ?e :where [?e :s $v]])",
+                value(MiniGrafValue::Text { value: "x".into() }),
+            ),
+            (
+                "(query [:find ?e :where [?e :f $v]])",
+                value(MiniGrafValue::Float64 { value: 2.5 }),
+            ),
+            (
+                "(query [:find ?e :where [?e :t $v]])",
+                value(MiniGrafValue::Bool { value: true }),
+            ),
+            (
+                "(query [:find ?e :where [?e :k $v]])",
+                value(MiniGrafValue::Keyword {
+                    value: ":kw".into(),
+                }),
+            ),
+            (
+                "(query [:find ?e :where [?e :z $v]])",
+                value(MiniGrafValue::Null),
+            ),
+            (
+                "(query [:find ?x :where [$v :n ?x]])",
+                value(MiniGrafValue::Ref { value: a.clone() }),
+            ),
+            (
+                "(query [:find ?x :where [$v :n ?x]])",
+                MiniGrafBindValue::Entity { uuid: a.clone() },
+            ),
+            (
+                "(query [:find ?x :as-of $v :where [?e :n ?x]])",
+                MiniGrafBindValue::TxCount { value: 1 },
+            ),
+            (
+                "(query [:find ?x :as-of $v :where [?e :n ?x]])",
+                MiniGrafBindValue::Timestamp { value: i64::MAX },
+            ),
+            (
+                "(query [:find ?x :valid-at $v :where [:a :n ?x]])",
+                MiniGrafBindValue::AnyValidTime,
+            ),
+        ] {
+            let pq = db.prepare(q.into()).expect("prepare");
+            let r = pq.execute(binds(&[("v", bind)])).expect("execute");
+            assert!(result_rows(&r) > 0, "the bind value matches");
+        }
+    }
+
+    #[test]
+    fn prepared_cursor_matches_execute() {
+        let db = prepared_db();
+        let pq = db
+            .prepare("(query [:find ?e ?n :where [?e :n ?n] [(>= ?n $min)]])".into())
+            .expect("prepare");
+        let all = result_rows(&pq.execute(binds(&[("min", int(2))])).expect("execute"));
+        let cursor = pq.query(binds(&[("min", int(2))])).expect("query");
+        assert_eq!(cursor.vars(), vec!["?e".to_string(), "?n".to_string()]);
+        let mut seen = 0;
+        while let Some(batch) = cursor.next_batch(1).expect("batch") {
+            seen += serde_json::from_str::<Vec<serde_json::Value>>(&batch)
+                .expect("rows")
+                .len();
+        }
+        assert_eq!(seen, all);
+        assert_eq!(seen, 2);
+    }
+
+    #[test]
+    fn prepared_bind_mistakes_are_api_errors() {
+        let db = prepared_db();
+        let api = |e: MiniGrafError, code: &str| {
+            assert!(matches!(e, MiniGrafError::Api { .. }), "an API error");
+            assert!(msg(e).starts_with(code), "the expected code");
+        };
+        let pq = db
+            .prepare("(query [:find ?e :where [?e :n $n]])".into())
+            .expect("prepare");
+        api(err(pq.execute(binds(&[]))), "[API-022]");
+        api(err(pq.query(binds(&[]))), "[API-022]");
+        for wrong in [
+            pq.execute(binds(&[("n", MiniGrafBindValue::TxCount { value: 1 })]))
+                .map(|_| ()),
+            pq.query(binds(&[("n", MiniGrafBindValue::TxCount { value: 1 })]))
+                .map(|_| ()),
+        ] {
+            api(err(wrong), "[API-024]");
+        }
+        api(
+            err(pq.query(binds(&[(
+                "n",
+                MiniGrafBindValue::Value {
+                    value: MiniGrafValue::Ref {
+                        value: "not-a-uuid".into(),
+                    },
+                },
+            )]))),
+            "[API-017]",
+        );
+        api(
+            err(db.prepare("(query [:find ?v :where [?e $a ?v]])".into())),
+            "[API-023]",
+        );
+        api(
+            err(db.prepare("(transact [[:a :n 1]])".into())),
+            "[API-005]",
+        );
+
+        let entity = db
+            .prepare("(query [:find ?x :where [$e :n ?x]])".into())
+            .expect("prepare");
+        api(
+            err(entity.execute(binds(&[(
+                "e",
+                MiniGrafBindValue::Entity {
+                    uuid: "not-a-uuid".into(),
+                },
+            )]))),
+            "[API-017]",
+        );
+        let as_of = db
+            .prepare("(query [:find ?x :as-of $t :where [?e :n ?x]])".into())
+            .expect("prepare");
+        api(
+            err(as_of.execute(binds(&[("t", MiniGrafBindValue::TxCount { value: -1 })]))),
+            "[API-017]",
+        );
+    }
+
+    #[test]
+    fn prepared_query_keeps_its_database_alive() {
+        let db = prepared_db();
+        let pq = db
+            .prepare("(query [:find ?e :where [?e :n $n]])".into())
+            .expect("prepare");
+        drop(db);
+        let r = pq.execute(binds(&[("n", int(1))])).expect("execute");
+        assert_eq!(result_rows(&r), 1);
+    }
+
+    #[test]
+    fn prepared_query_sees_later_writes() {
+        let db = prepared_db();
+        let pq = db
+            .prepare("(query [:find ?e :where [?e :n $n]])".into())
+            .expect("prepare");
+        assert_eq!(
+            result_rows(&pq.execute(binds(&[("n", int(4))])).expect("execute")),
+            0
+        );
+        db.execute("(transact [[:d :n 4]])".into())
+            .expect("transact");
+        assert_eq!(
+            result_rows(&pq.execute(binds(&[("n", int(4))])).expect("execute")),
+            1
+        );
     }
 }

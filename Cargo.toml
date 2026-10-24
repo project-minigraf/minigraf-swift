@@ -17,7 +17,7 @@ path = "src/uniffi_bindgen.rs"
 [dependencies]
 # Pin to the exact released version. The release workflow updates this line.
 # Unreleased v3 core (format v8). Switches to minigraf = "=3.0.0" at the v3.0.0 release.
-minigraf = { git = "https://github.com/project-minigraf/minigraf", rev = "949813ce27273d0c2820690df844e76951cb7996" }
+minigraf = { git = "https://github.com/project-minigraf/minigraf", rev = "5f2ba46e0c5a9954d90e52f60daaad2128d91973" }
 uniffi = { version = "0.31.1", features = ["cli"] }
 thiserror = "2.0.18"
 serde_json = "1.0.149"
