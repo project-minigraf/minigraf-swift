@@ -109,6 +109,13 @@ for `:as-of`, `.anyValidTime` for `:valid-at`). A missing slot throws
 `MiniGrafError.Api` with `[API-022]`, a slot in an attribute position `[API-023]`, and a
 value of the wrong kind `[API-024]`.
 
+A `Set` binds a set value, for `in?` and the other set predicates or a set-valued
+attribute: `pq.execute(["ids": Set([1, 2, 3])])`. Its elements conform to
+`MinigrafSetElement`: the plain values above, with `UUID` as a ref, or `MiniGrafValue`;
+mix types with `Set<MiniGrafValue>` (`[.keyword(value: ":role/admin"), .int64(value: 1)]`).
+A set inside a set throws `MiniGrafError.Api` with `[API-021]`. Set values come back as
+JSON arrays from `execute` and as `MiniGrafValue.set` in fact records.
+
 `MiniGrafError` is `.Parse`, `.Query`, `.Storage`, `.Api` (a bad argument, a closed
 object, a bind mistake) or `.Other`.
 

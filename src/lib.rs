@@ -198,7 +198,8 @@ impl OpenOptions {
 // ─── Values and fact records ─────────────────────────────────────────────────
 
 /// A fact value with its type kept, so a record can be written back exactly.
-/// `Ref` holds an entity UUID string.
+/// `Ref` holds an entity UUID string. `Set` holds the elements of a set
+/// value in canonical order; an element that is itself a `Set` is API-021.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum MiniGrafValue {
     Text { value: String },
@@ -208,6 +209,7 @@ pub enum MiniGrafValue {
     Ref { value: String },
     Keyword { value: String },
     Null,
+    Set { value: Vec<MiniGrafValue> },
 }
 
 impl From<Value> for MiniGrafValue {
@@ -222,6 +224,14 @@ impl From<Value> for MiniGrafValue {
             },
             Value::Keyword(value) => MiniGrafValue::Keyword { value },
             Value::Null => MiniGrafValue::Null,
+            Value::Set(set) => MiniGrafValue::Set {
+                value: set.iter().cloned().map(MiniGrafValue::from).collect(),
+            },
+            // A value kind newer than this binding: its debug form, until
+            // the binding learns it.
+            other => MiniGrafValue::Text {
+                value: format!("{other:?}"),
+            },
         }
     }
 }
@@ -236,6 +246,12 @@ impl MiniGrafValue {
             MiniGrafValue::Ref { value } => Value::Ref(parse_uuid(value, "ref value")?),
             MiniGrafValue::Keyword { value } => Value::Keyword(value.clone()),
             MiniGrafValue::Null => Value::Null,
+            MiniGrafValue::Set { value } => Value::Set(minigraf::ValueSet::new(
+                value
+                    .iter()
+                    .map(MiniGrafValue::to_core)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?),
         })
     }
 }
@@ -738,6 +754,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Ref(uuid) => JVal::String(uuid.to_string()),
         Value::Keyword(k) => JVal::String(k.clone()),
         Value::Null => JVal::Null,
+        Value::Set(set) => JVal::Array(set.iter().map(value_to_json).collect()),
+        // A value kind newer than this binding: its debug form.
+        other => JVal::String(format!("{other:?}")),
     }
 }
 
@@ -971,10 +990,48 @@ mod tests {
             Value::Ref(id),
             Value::Keyword(":k/w".into()),
             Value::Null,
+            Value::Set(
+                minigraf::ValueSet::new([
+                    Value::Integer(1),
+                    Value::Keyword(":k/w".into()),
+                    Value::Ref(id),
+                ])
+                .expect("set"),
+            ),
+            Value::Set(minigraf::ValueSet::default()),
         ] {
             let back = MiniGrafValue::from(v.clone()).to_core().expect("to_core");
             assert!(back == v, "value changed in round trip");
         }
+    }
+
+    #[test]
+    fn set_elements_dedup_and_nesting_is_api_021() {
+        let one = || MiniGrafValue::Int64 { value: 1 };
+        let back = MiniGrafValue::Set {
+            value: vec![one(), MiniGrafValue::Text { value: "a".into() }, one()],
+        }
+        .to_core()
+        .expect("to_core");
+        assert_eq!(
+            MiniGrafValue::from(back),
+            MiniGrafValue::Set {
+                value: vec![MiniGrafValue::Text { value: "a".into() }, one()]
+            },
+            "duplicates dropped, canonical order"
+        );
+        let e = err(MiniGrafValue::Set {
+            value: vec![MiniGrafValue::Set { value: vec![] }],
+        }
+        .to_core());
+        assert_eq!(e.code(), "API-021");
+    }
+
+    #[test]
+    fn set_is_a_json_array() {
+        let set =
+            minigraf::ValueSet::new([Value::Integer(2), Value::String("a".into())]).expect("set");
+        assert_eq!(value_to_json(&Value::Set(set)), serde_json::json!(["a", 2]));
     }
 
     #[test]

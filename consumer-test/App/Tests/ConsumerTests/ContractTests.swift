@@ -48,6 +48,15 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(typed.first?.first as? String, "Alice", "a typed value binds")
     }
 
+    func testSetValues() throws {
+        let db = try MiniGrafDb.openInMemory()
+        _ = try db.execute(datalog: #"(transact [[:alice :tags #{1 "x"}] [:alice :name "Alice"]])"#)
+        let tags = try rows(db.execute(datalog: "(query [:find ?t :where [?e :tags ?t]])"))
+        XCTAssertEqual((tags.first?.first as? [Any])?.count, 2, "a set value comes back as an array")
+        let pq = try db.prepare(datalog: "(query [:find ?n :where [?e :tags ?t] [(in? 1 $s)] [?e :name ?n]])")
+        XCTAssertEqual(try rows(pq.execute(["s": Set([1, 2])])).first?.first as? String, "Alice", "a set binds")
+    }
+
     func testErrorType() throws {
         let db = try MiniGrafDb.openInMemory()
         XCTAssertThrowsError(try db.execute(datalog: "(nosuchcommand [])")) { error in
