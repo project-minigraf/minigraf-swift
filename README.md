@@ -119,6 +119,63 @@ JSON arrays from `execute` and as `MiniGrafValue.set` in fact records.
 `MiniGrafError` is `.Parse`, `.Query`, `.Storage`, `.Api` (a bad argument, a closed
 object, a bind mistake) or `.Other`.
 
+## User functions
+
+A predicate conforms to `MiniGrafPredicate` (`test(value:) throws -> Bool`) and is
+called in Datalog as `[(name ?v)]`. An aggregate conforms to `MiniGrafAggregate`; its
+`accumulator()` returns a new `MiniGrafAccumulator` (`step(value:)`, `finish(count:)`)
+for each group or window partition, and it is used as `(name ?v)` in `:find` or with
+`:over`. Values arrive as `MiniGrafValue` (`.int64(value:)`, `.text(value:)`, …), and
+`finish` returns one. The protocols are `AnyObject, Sendable`: implement them with a
+`final class` whose stored properties are immutable, or mark it `@unchecked Sendable`
+when it keeps state of its own, as an accumulator does.
+
+```swift
+final class Adult: MiniGrafPredicate {
+    func test(value: MiniGrafValue) throws -> Bool {
+        guard case .int64(let age) = value else { throw MiniGrafUdfError.Failed(msg: "age is not an integer") }
+        return age >= 18
+    }
+}
+
+final class Product: MiniGrafAggregate {
+    final class Acc: MiniGrafAccumulator, @unchecked Sendable {
+        var product: Int64 = 1
+        func step(value: MiniGrafValue) throws {
+            if case .int64(let n) = value { product *= n }
+        }
+        func finish(count: Int64) throws -> MiniGrafValue { .int64(value: product) } // count: values stepped
+    }
+    func accumulator() throws -> MiniGrafAccumulator { Acc() }
+}
+
+try db.registerPredicate(name: "adult?", predicate: Adult())
+try db.registerAggregate(name: "product", aggregate: Product())
+_ = try db.execute(datalog: "(query [:find ?n :where [?e :age ?a] [(adult? ?a)] [?e :name ?n]])")
+_ = try db.execute(datalog: "(query [:find ?g (product ?a) :where [?e :group ?g] [?e :age ?a]])")
+_ = try db.execute(datalog: "(query [:find ?a (product ?a :over (:order-by ?a)) :where [?e :age ?a]])")
+```
+
+- **Failures.** A callback that throws stops the query with `QRY-014`, raised as
+  `MiniGrafError.Query`; it is never read as `false` or a missing value. Throw
+  `MiniGrafUdfError.Failed(msg:)` to choose the message. Any other error also fails the
+  call, with the first line of its `String(describing:)` as the message. A
+  `MiniGrafValue.ref` from `finish` whose value is not a UUID is a failing call too.
+- **Lifecycle.** The database keeps a strong reference to each registered object until
+  the database and every cursor and prepared query opened from it are released. There
+  is no unregister. Predicates and aggregates have separate names, and registering a
+  name twice in either is an error (`INT-040`). A query sees the functions registered
+  when it opened; a prepared query, those registered when each run starts.
+- **Threading.** A callback runs on the thread that calls `execute` (of the database or
+  a prepared query) or a cursor's `nextBatch`, including a prepared query's cursor.
+  Queries on different threads may call the same object at once, so it must be
+  thread-safe. One accumulator is used by one query on one thread at a time. Keep
+  callbacks short: a query on the main thread blocks it for as long as they run.
+- **Cost.** Each call crosses the FFI once: one foreign call per value.
+- **Re-entry.** A callback may query the same database, open a cursor or register another
+  function. Inside a write transaction, the calls the core refuses there still return
+  `INT-001`.
+
 ## Building from source
 
 Requires Rust stable toolchain with iOS targets and Xcode.

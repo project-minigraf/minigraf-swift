@@ -456,14 +456,7 @@ impl MiniGrafDb {
     }
 
     pub fn execute(&self, datalog: String) -> Result<String, MiniGrafError> {
-        let result = self
-            .inner
-            .lock()
-            .map_err(|_| MiniGrafError::Other {
-                msg: "mutex poisoned".into(),
-            })?
-            .execute(&datalog)
-            .map_err(MiniGrafError::from)?;
+        let result = self.db()?.execute(&datalog)?;
         Ok(query_result_to_json(result))
     }
 
@@ -482,7 +475,7 @@ impl MiniGrafDb {
 
     /// Open a cursor over a `(query ...)`. Its answer is fixed when it opens.
     pub fn query(&self, datalog: String) -> Result<Arc<MiniGrafCursor>, MiniGrafError> {
-        let cursor = lock(&self.inner)?.query(&datalog)?;
+        let cursor = self.db()?.query(&datalog)?;
         Ok(Arc::new(MiniGrafCursor {
             vars: cursor.vars().to_vec(),
             inner: Mutex::new(Some(cursor)),
@@ -493,7 +486,7 @@ impl MiniGrafDb {
     /// the log is closed or read to the end.
     pub fn fact_log(&self, filter: FactFilter) -> Result<Arc<MiniGrafFactLog>, MiniGrafError> {
         let filter = filter.to_core()?;
-        let log = lock(&self.inner)?.fact_log(&filter)?;
+        let log = self.db()?.fact_log(&filter)?;
         Ok(Arc::new(MiniGrafFactLog {
             inner: Mutex::new(Some(log)),
         }))
@@ -503,7 +496,7 @@ impl MiniGrafDb {
     /// different bind values in its `$name` slots. A transact, retract or
     /// rule is API-005/006/007; a slot in an attribute position is API-023.
     pub fn prepare(&self, datalog: String) -> Result<Arc<MiniGrafPreparedQuery>, MiniGrafError> {
-        let inner = lock(&self.inner)?.prepare(&datalog)?;
+        let inner = self.db()?.prepare(&datalog)?;
         Ok(Arc::new(MiniGrafPreparedQuery {
             _db: self.inner.clone(),
             inner,
@@ -512,18 +505,107 @@ impl MiniGrafDb {
 
     /// The transaction counter that `:as-of N` compares against.
     pub fn current_tx_count(&self) -> Result<i64, MiniGrafError> {
-        Ok(from_u64(lock(&self.inner)?.current_tx_count()))
+        Ok(from_u64(self.db()?.current_tx_count()))
     }
 
     pub fn checkpoint(&self) -> Result<(), MiniGrafError> {
-        self.inner
-            .lock()
-            .map_err(|_| MiniGrafError::Other {
-                msg: "mutex poisoned".into(),
-            })?
-            .checkpoint()
-            .map_err(MiniGrafError::from)
+        Ok(self.db()?.checkpoint()?)
     }
+
+    /// Register `predicate` under `name`, called in Datalog as
+    /// `[(name ?v)]`. A predicate that throws stops the query with QRY-014.
+    /// Queries already open keep the functions they opened with.
+    pub fn register_predicate(
+        &self,
+        name: String,
+        predicate: Arc<dyn MiniGrafPredicate>,
+    ) -> Result<(), MiniGrafError> {
+        Ok(self.db()?.try_register_predicate(&name, move |v| {
+            Ok(predicate.test(MiniGrafValue::from(v.clone()))?)
+        })?)
+    }
+
+    /// Register `aggregate` under `name`, used in `:find` as `(name ?v)` and
+    /// as a window function with `:over`. Each group or window partition
+    /// gets its own accumulator. A throw stops the query with QRY-014.
+    pub fn register_aggregate(
+        &self,
+        name: String,
+        aggregate: Arc<dyn MiniGrafAggregate>,
+    ) -> Result<(), MiniGrafError> {
+        Ok(self.db()?.try_register_aggregate(
+            &name,
+            move || Ok(aggregate.accumulator()?),
+            |acc: &mut Arc<dyn MiniGrafAccumulator>, v| {
+                Ok(acc.step(MiniGrafValue::from(v.clone()))?)
+            },
+            |acc, count| {
+                // A count of values held in memory stays far below i64::MAX.
+                let count = i64::try_from(count).unwrap_or(i64::MAX);
+                acc.finish(count)?
+                    .to_core()
+                    .map_err(|e| minigraf::UdfError::new(e.to_string()))
+            },
+        )?)
+    }
+}
+
+impl MiniGrafDb {
+    /// The database, cloned out of the handle so that no binding lock is
+    /// held while the core runs: a user function may call back into this
+    /// handle.
+    fn db(&self) -> Result<minigraf::Minigraf, MiniGrafError> {
+        Ok(lock(&self.inner)?.clone())
+    }
+}
+
+// ─── User functions ──────────────────────────────────────────────────────────
+
+/// Why a user function failed. A callback that throws anything else is
+/// mapped to this. The query stops with QRY-014, which carries `msg`.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MiniGrafUdfError {
+    #[error("{msg}")]
+    Failed { msg: String },
+}
+
+/// Any other exception. Kotlin sends its stack trace, so only the first
+/// line is kept: the exception's class and message.
+impl From<uniffi::UnexpectedUniFFICallbackError> for MiniGrafUdfError {
+    fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        let msg = e.reason.lines().next().unwrap_or_default().to_string();
+        MiniGrafUdfError::Failed { msg }
+    }
+}
+
+impl From<MiniGrafUdfError> for minigraf::UdfError {
+    fn from(e: MiniGrafUdfError) -> Self {
+        let MiniGrafUdfError::Failed { msg } = e;
+        minigraf::UdfError::new(msg)
+    }
+}
+
+/// A user predicate. It may be called from any thread that queries the
+/// database, concurrently, so it must be thread-safe.
+#[uniffi::export(with_foreign)]
+pub trait MiniGrafPredicate: Send + Sync {
+    fn test(&self, value: MiniGrafValue) -> Result<bool, MiniGrafUdfError>;
+}
+
+/// A user aggregate: a factory of accumulators.
+#[uniffi::export(with_foreign)]
+pub trait MiniGrafAggregate: Send + Sync {
+    /// A new, empty accumulator: one per group, or per window partition.
+    fn accumulator(&self) -> Result<Arc<dyn MiniGrafAccumulator>, MiniGrafUdfError>;
+}
+
+/// The running state of one aggregate. One query uses it, on one thread at
+/// a time.
+#[uniffi::export(with_foreign)]
+pub trait MiniGrafAccumulator: Send + Sync {
+    fn step(&self, value: MiniGrafValue) -> Result<(), MiniGrafUdfError>;
+    /// `count`: values stepped so far.
+    fn finish(&self, count: i64) -> Result<MiniGrafValue, MiniGrafUdfError>;
 }
 
 // ─── MiniGrafPreparedQuery ───────────────────────────────────────────────────
@@ -1429,5 +1511,274 @@ mod tests {
             result_rows(&pq.execute(binds(&[("n", int(4))])).expect("execute")),
             1
         );
+    }
+
+    // ─── User functions (#180) ───────────────────────────────────────────
+
+    struct IsEven;
+    impl MiniGrafPredicate for IsEven {
+        fn test(&self, value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            match value {
+                MiniGrafValue::Int64 { value } => Ok(value % 2 == 0),
+                _ => Err(MiniGrafUdfError::Failed {
+                    msg: "not an integer".into(),
+                }),
+            }
+        }
+    }
+
+    /// Sums integers; fails in `step` on `fail_on`, and `finish` returns
+    /// `out` when set.
+    struct Total {
+        fail_on: Option<i64>,
+        out: Option<MiniGrafValue>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct TotalAcc {
+        fail_on: Option<i64>,
+        out: Option<MiniGrafValue>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
+        sum: Mutex<i64>,
+    }
+    impl MiniGrafAggregate for Total {
+        fn accumulator(&self) -> Result<Arc<dyn MiniGrafAccumulator>, MiniGrafUdfError> {
+            Ok(Arc::new(TotalAcc {
+                fail_on: self.fail_on,
+                out: self.out.clone(),
+                steps: self.steps.clone(),
+                sum: Mutex::new(0),
+            }))
+        }
+    }
+    impl MiniGrafAccumulator for TotalAcc {
+        fn step(&self, value: MiniGrafValue) -> Result<(), MiniGrafUdfError> {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let MiniGrafValue::Int64 { value } = value else {
+                return Err(MiniGrafUdfError::Failed {
+                    msg: "not an integer".into(),
+                });
+            };
+            if Some(value) == self.fail_on {
+                return Err(MiniGrafUdfError::Failed {
+                    msg: format!("refused {value}"),
+                });
+            }
+            *self.sum.lock().unwrap() += value;
+            Ok(())
+        }
+        fn finish(&self, count: i64) -> Result<MiniGrafValue, MiniGrafUdfError> {
+            if let Some(out) = &self.out {
+                return Ok(out.clone());
+            }
+            Ok(MiniGrafValue::Text {
+                value: format!("{}/{count}", *self.sum.lock().unwrap()),
+            })
+        }
+    }
+
+    fn total(fail_on: Option<i64>, out: Option<MiniGrafValue>) -> Arc<Total> {
+        Arc::new(Total {
+            fail_on,
+            out,
+            steps: Arc::default(),
+        })
+    }
+
+    fn udf_db() -> Arc<MiniGrafDb> {
+        let db = MiniGrafDb::open_in_memory().expect("open");
+        db.execute(
+            "(transact [[:a :n 1] [:b :n 2] [:c :n 3] [:d :n 4] [:a :g 1] [:b :g 1] [:c :g 2] [:d :g 2]])"
+                .into(),
+        )
+        .expect("transact");
+        db
+    }
+
+    fn results(json: &str) -> Vec<serde_json::Value> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        v["results"].as_array().expect("results").clone()
+    }
+
+    #[test]
+    fn predicate_filters_rows() {
+        let db = udf_db();
+        db.register_predicate("even?".into(), Arc::new(IsEven))
+            .expect("register");
+        let mut rows = results(
+            &db.execute("(query [:find ?n :where [?e :n ?n] [(even? ?n)]])".into())
+                .expect("query"),
+        );
+        rows.sort_by_key(|r| r[0].as_i64());
+        assert_eq!(rows, vec![serde_json::json!([2]), serde_json::json!([4])]);
+    }
+
+    #[test]
+    fn failing_predicate_is_qry_014() {
+        let db = udf_db();
+        db.execute(r#"(transact [[:e :n "x"]])"#.into())
+            .expect("transact");
+        db.register_predicate("even?".into(), Arc::new(IsEven))
+            .expect("register");
+        let e = err(db.execute("(query [:find ?n :where [?e :n ?n] [(even? ?n)]])".into()));
+        let MiniGrafError::Query { msg } = e else {
+            panic!("expected a query error");
+        };
+        assert!(msg.contains("QRY-014") && msg.contains("even?") && msg.contains("not an integer"));
+    }
+
+    #[test]
+    fn aggregate_in_find_and_over() {
+        let db = udf_db();
+        db.register_aggregate("total".into(), total(None, None))
+            .expect("register");
+        let rows = results(
+            &db.execute("(query [:find (total ?n) :where [?e :n ?n]])".into())
+                .expect("find"),
+        );
+        assert_eq!(rows, vec![serde_json::json!(["10/4"])]);
+        let mut rows = results(
+            &db.execute(
+                "(query [:find ?n (total ?n :over (:partition-by ?g :order-by ?n)) :where [?e :n ?n] [?e :g ?g]])"
+                    .into(),
+            )
+            .expect("over"),
+        );
+        rows.sort_by_key(|r| r[0].as_i64());
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!([1, "1/1"]),
+                serde_json::json!([2, "3/2"]),
+                serde_json::json!([3, "3/1"]),
+                serde_json::json!([4, "7/2"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn failing_step_is_qry_014_and_stops() {
+        let db = udf_db();
+        let agg = total(Some(2), None);
+        db.register_aggregate("total".into(), agg.clone())
+            .expect("register");
+        let e = err(db.execute("(query [:find (total ?n) :where [?e :n ?n]])".into()));
+        let MiniGrafError::Query { msg } = e else {
+            panic!("expected a query error");
+        };
+        assert!(msg.contains("QRY-014") && msg.contains("refused 2"));
+        assert!(
+            agg.steps.load(std::sync::atomic::Ordering::SeqCst) <= 4,
+            "no step after the whole input"
+        );
+    }
+
+    #[test]
+    fn bad_ref_from_finish_is_qry_014() {
+        let db = udf_db();
+        let bad = MiniGrafValue::Ref {
+            value: "nope".into(),
+        };
+        db.register_aggregate("total".into(), total(None, Some(bad)))
+            .expect("register");
+        let e = err(db.execute("(query [:find (total ?n) :where [?e :n ?n]])".into()));
+        let MiniGrafError::Query { msg } = e else {
+            panic!("expected a query error");
+        };
+        assert!(msg.contains("QRY-014") && msg.contains(r#"ref value "nope" is not a UUID"#));
+    }
+
+    #[test]
+    fn finish_ref_reaches_the_result() {
+        let db = udf_db();
+        let id = "6f1c2a3b-4d5e-4f60-8172-839ab4c5d6e7".to_string();
+        db.register_aggregate(
+            "total".into(),
+            total(None, Some(MiniGrafValue::Ref { value: id.clone() })),
+        )
+        .expect("register");
+        let rows = results(
+            &db.execute("(query [:find (total ?n) :where [?e :n ?n]])".into())
+                .expect("find"),
+        );
+        assert_eq!(rows, vec![serde_json::json!([id])]);
+    }
+
+    /// Queries the database it is registered on from inside the call.
+    struct Reenter(std::sync::Weak<MiniGrafDb>, std::sync::atomic::AtomicBool);
+    impl MiniGrafPredicate for Reenter {
+        fn test(&self, value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            let db = self.0.upgrade().ok_or(MiniGrafUdfError::Failed {
+                msg: "db gone".into(),
+            })?;
+            let MiniGrafValue::Int64 { value } = value else {
+                return Ok(false);
+            };
+            let fail = |e: MiniGrafError| MiniGrafUdfError::Failed { msg: e.to_string() };
+            let json = db
+                .execute(format!(
+                    "(query [:find ?e :where [?e :n {value}] [?e :g 2]])"
+                ))
+                .map_err(fail)?;
+            let cursor = db
+                .query("(query [:find ?n :where [?e :n ?n]])".into())
+                .map_err(fail)?;
+            let _ = cursor.next_batch(10).map_err(fail)?;
+            if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                db.register_predicate("late?".into(), Arc::new(IsEven))
+                    .map_err(fail)?;
+            }
+            Ok(!results(&json).is_empty())
+        }
+    }
+
+    #[test]
+    fn predicate_can_query_its_own_database() {
+        let db = udf_db();
+        db.register_predicate(
+            "g2?".into(),
+            Arc::new(Reenter(Arc::downgrade(&db), Default::default())),
+        )
+        .expect("register");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db2 = db.clone();
+        std::thread::spawn(move || {
+            let r = db2.execute("(query [:find ?n :where [?e :n ?n] [(g2? ?n)]])".into());
+            let _ = tx.send(r.map(|json| results(&json)));
+        });
+        let mut rows = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("no deadlock")
+            .expect("query");
+        rows.sort_by_key(|r| r[0].as_i64());
+        assert_eq!(rows, vec![serde_json::json!([3]), serde_json::json!([4])]);
+        let later = db
+            .execute("(query [:find ?n :where [?e :n ?n] [(late? ?n)]])".into())
+            .expect("registered from inside the call");
+        assert_eq!(results(&later).len(), 2);
+    }
+
+    #[test]
+    fn registering_a_name_twice_is_int_040() {
+        let db = udf_db();
+        db.register_predicate("even?".into(), Arc::new(IsEven))
+            .expect("register");
+        let e = err(db.register_predicate("even?".into(), Arc::new(IsEven)));
+        assert!(msg(e).starts_with("[INT-040]"));
+        db.register_aggregate("total".into(), total(None, None))
+            .expect("aggregates have their own names");
+        let e = err(db.register_aggregate("total".into(), total(None, None)));
+        assert!(msg(e).starts_with("[INT-040]"));
+    }
+
+    #[test]
+    fn unexpected_callback_error_becomes_failed() {
+        let e = MiniGrafUdfError::from(uniffi::UnexpectedUniFFICallbackError {
+            reason: "boom".into(),
+        });
+        assert_eq!(e.to_string(), "boom");
+        let e = MiniGrafUdfError::from(uniffi::UnexpectedUniFFICallbackError {
+            reason: "java.lang.IllegalStateException: no\n\tat Foo.test(Foo.kt:3)\n".into(),
+        });
+        assert_eq!(e.to_string(), "java.lang.IllegalStateException: no");
     }
 }
