@@ -225,6 +225,176 @@ do {
     check(errorText { _ = try member.execute(["s": Set<MiniGrafValue>([.set(value: [])])]) }.hasPrefix("[API-021]"), "API-021")
 }
 
+// #180: user predicates and aggregates written in Swift.
+final class IsEven: MiniGrafPredicate {
+    func test(value: MiniGrafValue) throws -> Bool {
+        guard case .int64(let n) = value else { throw MiniGrafUdfError.Failed(msg: "not an integer") }
+        return n % 2 == 0
+    }
+}
+
+/// Sums integers; `step` throws on `failOn`. One accumulator is used by one
+/// query on one thread at a time, so its state needs no lock.
+final class Total: MiniGrafAggregate {
+    let failOn: Int64?
+    init(failOn: Int64? = nil) { self.failOn = failOn }
+
+    final class Sum: MiniGrafAccumulator, @unchecked Sendable {
+        let failOn: Int64?
+        var sum: Int64 = 0
+        init(failOn: Int64?) { self.failOn = failOn }
+        func step(value: MiniGrafValue) throws {
+            guard case .int64(let n) = value else { throw MiniGrafUdfError.Failed(msg: "not an integer") }
+            if n == failOn { throw MiniGrafUdfError.Failed(msg: "refused \(n)") }
+            sum += n
+        }
+        func finish(count: Int64) throws -> MiniGrafValue { .int64(value: sum) }
+    }
+
+    func accumulator() throws -> MiniGrafAccumulator { Sum(failOn: failOn) }
+}
+
+final class Throws: MiniGrafPredicate {
+    struct Own: Error, CustomStringConvertible { var description: String { "own error" } }
+    func test(value: MiniGrafValue) throws -> Bool { throw Own() }
+}
+
+final class BadRef: MiniGrafAggregate {
+    final class Acc: MiniGrafAccumulator {
+        func step(value: MiniGrafValue) throws {}
+        func finish(count: Int64) throws -> MiniGrafValue { .ref(value: "nope") }
+    }
+    func accumulator() throws -> MiniGrafAccumulator { Acc() }
+}
+
+/// Answers by querying the database it is registered on.
+final class InGroup2: MiniGrafPredicate {
+    let db: MiniGrafDb
+    init(_ db: MiniGrafDb) { self.db = db }
+    func test(value: MiniGrafValue) throws -> Bool {
+        guard case .int64(let n) = value else { return false }
+        return !udfRows(try db.execute(datalog: "(query [:find ?e :where [?e :n \(n)] [?e :g 2]])")).isEmpty
+    }
+}
+
+/// Each call waits until a call from another thread arrives.
+final class Rendezvous: MiniGrafPredicate, @unchecked Sendable {
+    let lock = NSCondition()
+    var arrived = 0
+    func test(value: MiniGrafValue) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        arrived += 1
+        lock.broadcast()
+        let deadline = Date().addingTimeInterval(10)
+        while arrived < 2 {
+            if !lock.wait(until: deadline) { throw MiniGrafUdfError.Failed(msg: "the other query never arrived") }
+        }
+        return true
+    }
+}
+
+func udfRows(_ json: String) -> [[Int]] {
+    let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+    let rows = object?["results"] as? [[Any]] ?? []
+    return rows.map { $0.map { ($0 as? NSNumber)?.intValue ?? Int.min } }.sorted { $0.lexicographicallyPrecedes($1) }
+}
+
+func queryError(_ body: () throws -> Void) -> String {
+    do {
+        try body()
+        return "no error"
+    } catch MiniGrafError.Query(let msg) {
+        return msg
+    } catch {
+        return "not a query error: \(error)"
+    }
+}
+
+func udfDb() throws -> MiniGrafDb {
+    let db = try MiniGrafDb.openInMemory()
+    _ = try db.execute(datalog: "(transact [[:a :n 1] [:b :n 2] [:c :n 3] [:d :n 4] [:a :g 1] [:b :g 1] [:c :g 2] [:d :g 2]])")
+    return db
+}
+
+do {
+    let evenQuery = "(query [:find ?n :where [?e :n ?n] [(even? ?n)]])"
+
+    let db = try udfDb()
+    try db.registerPredicate(name: "even?", predicate: IsEven())
+    check(udfRows(try db.execute(datalog: evenQuery)) == [[2], [4]], "a predicate filters rows")
+
+    try db.registerAggregate(name: "total", aggregate: Total())
+    check(udfRows(try db.execute(datalog: "(query [:find (total ?n) :where [?e :n ?n]])")) == [[10]], "an aggregate in :find")
+    // A running total per group: 1, 1+2 in group 1; 3, 3+4 in group 2.
+    let over = "(query [:find ?n (total ?n :over (:partition-by ?g :order-by ?n)) :where [?e :n ?n] [?e :g ?g]])"
+    check(udfRows(try db.execute(datalog: over)) == [[1, 1], [2, 3], [3, 3], [4, 7]], "an aggregate with :over")
+
+    var found: [[Int]] = []
+    try db.query(datalog: evenQuery).forEachBatch(size: 1) { batch in
+        found += ((try JSONSerialization.jsonObject(with: Data(batch.utf8))) as? [[NSNumber]] ?? []).map { $0.map(\.intValue) }
+    }
+    check(found.sorted { $0.lexicographicallyPrecedes($1) } == [[2], [4]], "a cursor calls a predicate")
+
+    check(errorText { try db.registerPredicate(name: "even?", predicate: IsEven()) }.hasPrefix("[INT-040]"), "a name registers once")
+
+    _ = try db.execute(datalog: #"(transact [[:e :n "x"]])"#)
+    let failed = queryError { _ = try db.execute(datalog: evenQuery) }
+    check(failed.hasPrefix("[QRY-014]") && failed.contains("not an integer"), "MiniGrafUdfError is QRY-014 with its message")
+
+    let own = try udfDb()
+    try own.registerPredicate(name: "broken?", predicate: Throws())
+    check(queryError { _ = try own.execute(datalog: "(query [:find ?n :where [?e :n ?n] [(broken? ?n)]])") }
+        == "[QRY-014] user function `broken?` failed: own error", "any Swift error is QRY-014 with its description")
+
+    let step = try udfDb()
+    try step.registerAggregate(name: "total", aggregate: Total(failOn: 2))
+    let stepped = queryError { _ = try step.execute(datalog: "(query [:find (total ?n) :where [?e :n ?n]])") }
+    check(stepped.hasPrefix("[QRY-014]") && stepped.contains("refused 2"), "a failing step is QRY-014")
+    let cursorFailed = queryError {
+        try step.query(datalog: "(query [:find (total ?n) :where [?e :n ?n]])").forEachBatch(size: 10) { _ in }
+    }
+    check(cursorFailed.hasPrefix("[QRY-014]"), "a failure in a cursor is QRY-014")
+
+    let bad = try udfDb()
+    try bad.registerAggregate(name: "bad", aggregate: BadRef())
+    check(queryError { _ = try bad.execute(datalog: "(query [:find (bad ?n) :where [?e :n ?n]])") }.hasPrefix("[QRY-014]"),
+          "a non-UUID ref from finish is QRY-014")
+
+    let reentry = try udfDb()
+    try reentry.registerPredicate(name: "g2?", predicate: InGroup2(reentry))
+    check(udfRows(try reentry.execute(datalog: "(query [:find ?n :where [?e :n ?n] [(g2? ?n)]])")) == [[3], [4]],
+          "a predicate queries the same database")
+
+    let pq = try reentry.prepare(datalog: "(query [:find (total ?n) :where [?e :g $g] [?e :n ?n]])")
+    check(errorText { _ = try pq.execute(["g": 1]) } != "no error", "an unregistered aggregate fails")
+    try reentry.registerAggregate(name: "total", aggregate: Total())
+    check(udfRows(try pq.execute(["g": 1])) == [[3]], "a prepared query sees functions registered before each run")
+    var prepared: [String] = []
+    try pq.query(["g": 2]).forEachBatch(size: 10) { prepared.append($0) }
+    check(prepared == ["[[7]]"], "a prepared cursor calls an aggregate")
+
+    // Each call waits until a call from the other thread arrives: this only
+    // finishes if neither query holds a binding lock while the core runs.
+    let shared = try udfDb()
+    try shared.registerPredicate(name: "meet?", predicate: Rendezvous())
+    let group = DispatchGroup()
+    let outcomesLock = NSLock()
+    var outcomes: [String] = []
+    for _ in 0..<2 {
+        group.enter()
+        Thread.detachNewThread {
+            let outcome = queryError { _ = try shared.execute(datalog: "(query [:find ?n :where [:a :n ?n] [(meet? ?n)]])") }
+            outcomesLock.lock()
+            outcomes.append(outcome)
+            outcomesLock.unlock()
+            group.leave()
+        }
+    }
+    group.wait()
+    check(outcomes == ["no error", "no error"], "two queries are in one predicate at once")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")
