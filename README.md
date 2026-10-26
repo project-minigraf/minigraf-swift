@@ -13,7 +13,7 @@ Or add to `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "2.0.10")
+    .package(url: "https://github.com/project-minigraf/minigraf-swift", from: "2.0.11")
 ]
 ```
 
