@@ -1,5 +1,6 @@
 name: MinigrafBenchmark
 options:
+  xcodeVersion: "15.4"
   bundleIdPrefix: io.github.project-minigraf
   deploymentTarget:
     iOS: "16.0"
