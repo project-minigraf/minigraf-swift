@@ -1,0 +1,36 @@
+name: Build Device Farm benchmark (correctness only)
+on:
+  push:
+    branches: [bench/839-device-farm]
+    paths: [bench/device-farm/**, .github/workflows/bench-839-build.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: binding
+      - uses: actions/checkout@v4
+        with:
+          repository: project-minigraf/minigraf
+          ref: 33e5dffadebe0124e6287fc91cede4ff2b7a2b2f
+          path: core
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build packages and check correctness (no timing)
+        run: bash binding/bench/device-farm/build.sh core
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: device-farm-ios
+          path: |
+            binding/bench/device-farm/build/dist/
+            binding/bench/device-farm/build/evidence/
+          if-no-files-found: error
+          retention-days: 30
