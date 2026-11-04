@@ -27,7 +27,9 @@ PY
 cargo test --lib
 cargo build --locked --release --lib --target aarch64-apple-ios
 cargo build --locked --release --lib --target aarch64-apple-ios-sim
-cargo run --locked --release --bin uniffi-bindgen -- generate \
+# Bindgen is a build tool; reuse the host debug dependencies from cargo test.
+# Both libraries consumed by XCTest above remain optimized release builds.
+cargo run --locked --bin uniffi-bindgen -- generate \
   --library target/aarch64-apple-ios/release/libminigraf_ffi.a \
   --language swift --out-dir bench/device-farm/build/generated
 mkdir bench/device-farm/build/includes
@@ -56,13 +58,13 @@ record = dict(core_revision=sys.argv[1], binding_revision=sys.argv[2], evidence_
     xcode=subprocess.check_output(['xcodebuild','-version'],text=True).strip(),
     ios_sdk=subprocess.check_output(['xcrun','--sdk','iphoneos','--show-sdk-version'],text=True).strip(),
     profile='Release', swift_optimization='-O', rust_profile='release (binding workspace defaults)',
-    abi='aarch64-apple-ios', uniffi=uniffi[0], xcodegen='2.44.1')
+    abi='aarch64-apple-ios', uniffi=uniffi[0], xcodegen='2.46.0')
 (root/'build/build.json').write_text(json.dumps(record,indent=2)+'\n')
 PY
 cp Cargo.lock bench/device-farm/build/evidence/
 cd bench/device-farm
-curl --fail --location --retry 3 https://github.com/yonaskolb/XcodeGen/releases/download/2.44.1/xcodegen.zip -o build/xcodegen.zip
-echo 'a2e905fb68446e9bb4008cdfe2e13e3f176d0cbcca828b71770f8e53fca91b73  build/xcodegen.zip' | shasum -a 256 -c -
+curl --fail --location --retry 3 https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip -o build/xcodegen.zip
+echo '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806  build/xcodegen.zip' | shasum -a 256 -c -
 unzip -q build/xcodegen.zip -d build/tools
 build/tools/xcodegen/bin/xcodegen generate
 simulator=$(xcrun simctl list devices available --json | python3 -c '
