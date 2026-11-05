@@ -1,0 +1,52 @@
+name: MinigrafBenchmark
+options:
+  xcodeVersion: "15.4"
+  projectFormat: xcode15_3
+  bundleIdPrefix: io.github.project-minigraf
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    GENERATE_INFOPLIST_FILE: YES
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.0.0"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    ENABLE_BITCODE: NO
+    SWIFT_OPTIMIZATION_LEVEL: "-O"
+    ENABLE_TESTABILITY: NO
+targets:
+  MinigrafBenchmark:
+    type: application
+    platform: iOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.project-minigraf.benchmark
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+  BenchmarkTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+      - path: ../../Sources/MinigrafKit
+      - path: build/generated
+        includes: ["*.swift"]
+      - path: build/build.json
+        buildPhase: resources
+    dependencies:
+      - target: MinigrafBenchmark
+      - framework: build/minigrafFFI.xcframework
+        embed: false
+schemes:
+  MinigrafBenchmark:
+    build:
+      targets:
+        MinigrafBenchmark: all
+        BenchmarkTests: [test]
+    test:
+      config: Release
+      targets:
+        - BenchmarkTests
+      gatherCoverageData: false
