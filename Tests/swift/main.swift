@@ -395,6 +395,88 @@ do {
     check(outcomes == ["no error", "no error"], "two queries are in one predicate at once")
 }
 
+// #872: the override list, the new open options and the prepared setters.
+do {
+    check(Overridable.defaults == [.maxDerivedFacts, .maxResults, .maxIterations], "defaults from core")
+    func rows(_ json: String) -> Int {
+        let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+        return (object?["results"] as? [Any])?.count ?? -1
+    }
+    func reachDb(_ name: String, _ options: OpenOptions = OpenOptions()) throws -> MiniGrafDb {
+        let db = try MiniGrafDb.openWithOptions(path: path("\(name).graph"), options: options)
+        _ = try db.execute(datalog: "(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d] [:d :edge :e] [:p :v 1] [:q :v 1] [:r :v 2]])")
+        _ = try db.execute(datalog: "(rule [(reach ?x ?y) [?x :edge ?y]])")
+        _ = try db.execute(datalog: "(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])")
+        return db
+    }
+    let reach = "(query [:find ?x ?y :where (reach ?x ?y)])"
+    let grouped = "(query [:find ?v (count ?e) :where [?e :v ?v]])"
+    let derivedKeyword = "(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 100])"
+    let memoryKeyword = "(query [:find ?x ?y :where (reach ?x ?y) :query-memory-limit 1000000])"
+    let cases: [(String, [Overridable]?, Bool, Bool)] = [
+        ("ov-absent", nil, true, false),
+        ("ov-defaults", Overridable.defaults, true, false),
+        ("ov-empty", [], false, false),
+        ("ov-memory", [.queryMemoryLimit, .queryMemoryLimit], false, true),
+        ("ov-all", [.maxDerivedFacts, .maxResults, .queryMemoryLimit, .maxIterations], true, true),
+    ]
+    for (name, list, derivedOk, memoryOk) in cases {
+        let db = try reachDb(name, OpenOptions(allowOverrides: list))
+        for (q, ok) in [(derivedKeyword, derivedOk), (memoryKeyword, memoryOk)] {
+            if ok {
+                check(rows(try db.execute(datalog: q)) == 10, "\(name) allows \(q)")
+                _ = try db.query(datalog: q)
+                _ = try db.prepare(datalog: q)
+            } else {
+                check(errorText { _ = try db.execute(datalog: q) }.hasPrefix("[API-025]"), "\(name) execute API-025")
+                check(errorText { _ = try db.query(datalog: q) }.hasPrefix("[API-025]"), "\(name) query API-025")
+                check(errorText { _ = try db.prepare(datalog: q) }.hasPrefix("[API-025]"), "\(name) prepare API-025")
+            }
+        }
+    }
+
+    let chunkPath = path("chunk.graph")
+    do {
+        let db = try MiniGrafDb.openWithOptions(path: chunkPath, options: OpenOptions(transactionChunkFacts: 2))
+        let facts = (0..<10).map { "[:e\($0) :n \($0)]" }.joined()
+        _ = try db.execute(datalog: "(transact [\(facts)])")
+    }
+    check(rows(try MiniGrafDb.open(path: chunkPath).execute(datalog: "(query [:find ?n :where [?e :n ?n]])")) == 10, "chunked transaction committed")
+    check(errorText { _ = try MiniGrafDb.openWithOptions(path: path("bad-chunk.graph"), options: OpenOptions(transactionChunkFacts: -1)) }.hasPrefix("[API-017]"), "negative chunk API-017")
+
+    check(rows(try reachDb("it-default").execute(datalog: reach)) == 10, "default rounds")
+    check(errorText { _ = try reachDb("it-one", OpenOptions(maxIterations: 1)).execute(datalog: reach) }.hasPrefix("[INT-020]"), "maxIterations 1 INT-020")
+    check(rows(try reachDb("it-max", OpenOptions(maxIterations: Int64.max)).execute(datalog: reach)) == 10, "Int64.max rounds")
+    check(errorText { _ = try MiniGrafDb.openWithOptions(path: path("bad-it.graph"), options: OpenOptions(maxIterations: -1)) }.hasPrefix("[API-017]"), "negative maxIterations API-017")
+
+    let out = path("ov-out.graph")
+    let writer = try MiniGrafLogWriter.create(path: out, options: OpenOptions(allowOverrides: [], transactionChunkFacts: 2, maxIterations: 5))
+    try writer.finish()
+    check(FileManager.default.fileExists(atPath: out), "log writer takes the new options")
+
+    // The setters are not gated: every override keyword is refused here.
+    let db = try reachDb("setters", OpenOptions(allowOverrides: []))
+    let setters: [(String, (MiniGrafPreparedQuery, Int64) throws -> MiniGrafPreparedQuery, Int64, String)] = [
+        (reach, { try $0.withMaxDerivedFacts(n: $1) }, 1, "[INT-020]"),
+        (reach, { try $0.withMaxIterations(n: $1) }, 1, "[INT-020]"),
+        (grouped, { try $0.withQueryMemoryLimit(bytes: $1) }, 16, "[QRY-012]"),
+    ]
+    for (q, setter, limit, code) in setters {
+        let pq = try db.prepare(datalog: q)
+        let before = rows(try pq.execute([:]))
+        let derived = try setter(pq, limit)
+        check(errorText { _ = try derived.execute([:]) }.hasPrefix(code), "derived \(code)")
+        check(errorText { try derived.query([:]).forEachBatch(size: 100) { _ in } }.hasPrefix(code), "derived cursor \(code)")
+        check(rows(try pq.execute([:])) == before, "receiver unchanged")
+        check(rows(try setter(derived, Int64.max).execute([:])) == before, "Int64.max is no limit")
+        check(errorText { _ = try setter(pq, -1) }.hasPrefix("[API-017]"), "negative setter API-017")
+    }
+    let pq = try db.prepare(datalog: reach)
+    let chained = try pq.withMaxDerivedFacts(n: 1).withMaxIterations(n: 1).withMaxIterations(n: Int64.max)
+    check(errorText { _ = try chained.execute([:]) }.hasPrefix("[INT-020]"), "earlier limit kept")
+    check(rows(try chained.withMaxDerivedFacts(n: Int64.max).execute([:])) == 10, "last value applies")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")

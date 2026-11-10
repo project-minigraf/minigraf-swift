@@ -90,6 +90,31 @@ final class ContractTests: XCTestCase {
         }
     }
 
+    // minigraf#872: the override list, the new open options and a prepared setter.
+    func testOverridesOptionsAndSetters() throws {
+        XCTAssertEqual(Overridable.defaults, [.maxDerivedFacts, .maxResults, .maxIterations])
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("overrides-\(UUID().uuidString).graph").path
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let db = try MiniGrafDb.openWithOptions(
+            path: path,
+            options: OpenOptions(allowOverrides: [], transactionChunkFacts: 2, maxIterations: 1000)
+        )
+        _ = try db.execute(datalog: "(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d]])")
+        _ = try db.execute(datalog: "(rule [(reach ?x ?y) [?x :edge ?y]])")
+        _ = try db.execute(datalog: "(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])")
+        XCTAssertThrowsError(try db.execute(datalog: "(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 10])")) { error in
+            guard case MiniGrafError.Api(let msg) = error else { return XCTFail("threw \(error), not MiniGrafError.Api") }
+            XCTAssertTrue(msg.hasPrefix("[API-025]"), msg)
+        }
+        let pq = try db.prepare(datalog: "(query [:find ?x ?y :where (reach ?x ?y)])")
+        let derived = try pq.withMaxIterations(n: 1)
+        XCTAssertThrowsError(try derived.execute([:])) { error in
+            XCTAssertTrue(String(describing: error).contains("[INT-020]"), "threw \(error)")
+        }
+        XCTAssertEqual(try rows(pq.execute([:])).count, 6)
+    }
+
     func testErrorType() throws {
         let db = try MiniGrafDb.openInMemory()
         XCTAssertThrowsError(try db.execute(datalog: "(nosuchcommand [])")) { error in
