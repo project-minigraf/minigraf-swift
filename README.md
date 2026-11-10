@@ -89,6 +89,26 @@ more throws `MiniGrafError.Query` with QRY-012 and frees what it held. The defau
 `Int64.max`, is no limit. Rows a cursor returns are not counted, so read a large answer
 with `query(datalog:)`.
 
+Query text may override some settings with keywords such as `:max-derived-facts 1000`.
+`OpenOptions(allowOverrides:)` lists the `Overridable` keywords it may use
+(`.maxDerivedFacts`, `.maxResults`, `.queryMemoryLimit`, `.maxIterations`). Left `nil`, the
+defaults apply: `Overridable.defaults`, read from the core library (today
+`.maxDerivedFacts`, `.maxResults` and `.maxIterations`). A list replaces the defaults, it
+does not add to them, and `[]` refuses every keyword: a query that uses one throws
+`MiniGrafError.Api` with `[API-025]` from `execute`, `query` and `prepare`.
+
+```swift
+let db = try MiniGrafDb.openWithOptions(path: path, options: OpenOptions(
+    allowOverrides: Overridable.defaults + [.queryMemoryLimit],
+    transactionChunkFacts: 16_384,  // facts staged before a large transaction is chunked
+    maxIterations: 10_000           // rounds per stratum of a rule query, else INT-020
+))
+```
+
+`maxIterations` defaults to 1,000,000 and `Int64.max` is no limit;
+`transactionChunkFacts` defaults to 65,536 and is clamped to 1...1,000,000. A negative
+count throws `[API-017]`.
+
 ## Prepared queries
 
 `db.prepare(datalog:)` parses a query once; run it with its `$slots` bound (names
@@ -118,6 +138,19 @@ JSON arrays from `execute` and as `MiniGrafValue.set` in fact records.
 
 `MiniGrafError` is `.Parse`, `.Query`, `.Storage`, `.Api` (a bad argument, a closed
 object, a bind mistake) or `.Other`.
+
+`withMaxDerivedFacts(n:)`, `withQueryMemoryLimit(bytes:)` and `withMaxIterations(n:)`
+each return a new prepared query with that limit; the one they are called on is
+unchanged. They are application code, so `allowOverrides` does not apply to them, and an
+allowed keyword in the query text still overrides them. `Int64.max` means no limit and a
+negative value throws `[API-017]`. A derived query keeps its database open, as any
+prepared query does.
+
+```swift
+let reach = try db.prepare(datalog: "(query [:find ?x ?y :where (reach ?x ?y)])")
+let small = try reach.withMaxDerivedFacts(n: 10_000).withQueryMemoryLimit(bytes: 16_777_216)
+_ = try small.execute([:])  // INT-020 or QRY-012 past a limit; reach is unchanged
+```
 
 ## User functions
 

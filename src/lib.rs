@@ -87,6 +87,16 @@ fn to_usize(n: i64, what: &str) -> Result<usize, MiniGrafError> {
     })
 }
 
+/// A limit: `i64::MAX` stands for core's `usize::MAX` (no limit), which is
+/// out of reach of a signed count; any other negative count is API-017.
+fn to_limit(n: i64, what: &str) -> Result<usize, MiniGrafError> {
+    if n == i64::MAX {
+        Ok(usize::MAX)
+    } else {
+        to_usize(n, what)
+    }
+}
+
 /// A transaction counter or timestamp for the FFI. Both stay far below
 /// `i64::MAX` (a counter of one per transaction; Unix milliseconds).
 fn from_u64(n: u64) -> i64 {
@@ -108,6 +118,52 @@ pub enum SyncMode {
     Full,
     /// Flush only at checkpoints.
     Normal,
+}
+
+/// A query keyword that `OpenOptions.allow_overrides` may let query text
+/// use. See the Rust `Overridable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Overridable {
+    /// `:max-derived-facts` (in the defaults).
+    MaxDerivedFacts,
+    /// `:max-results` (in the defaults).
+    MaxResults,
+    /// `:query-memory-limit` (not in the defaults).
+    QueryMemoryLimit,
+    /// `:max-iterations` (in the defaults).
+    MaxIterations,
+}
+
+impl Overridable {
+    fn to_core(self) -> minigraf::Overridable {
+        match self {
+            Overridable::MaxDerivedFacts => minigraf::Overridable::MaxDerivedFacts,
+            Overridable::MaxResults => minigraf::Overridable::MaxResults,
+            Overridable::QueryMemoryLimit => minigraf::Overridable::QueryMemoryLimit,
+            Overridable::MaxIterations => minigraf::Overridable::MaxIterations,
+        }
+    }
+
+    fn from_core(o: minigraf::Overridable) -> Option<Self> {
+        match o {
+            minigraf::Overridable::MaxDerivedFacts => Some(Overridable::MaxDerivedFacts),
+            minigraf::Overridable::MaxResults => Some(Overridable::MaxResults),
+            minigraf::Overridable::QueryMemoryLimit => Some(Overridable::QueryMemoryLimit),
+            minigraf::Overridable::MaxIterations => Some(Overridable::MaxIterations),
+            _ => None,
+        }
+    }
+}
+
+/// The override list that applies when `OpenOptions.allow_overrides` is
+/// absent: the Rust `Overridable::DEFAULTS`.
+#[uniffi::export]
+pub fn overridable_defaults() -> Vec<Overridable> {
+    minigraf::Overridable::DEFAULTS
+        .iter()
+        .copied()
+        .filter_map(Overridable::from_core)
+        .collect()
 }
 
 /// Options for `MiniGrafDb.open_with_options` and `MiniGrafLogWriter.create`.
@@ -142,6 +198,19 @@ pub struct OpenOptions {
     /// limit, the default.
     #[uniffi(default)]
     pub query_memory_limit: Option<i64>,
+    /// The query keywords query text may use to override these settings.
+    /// Absent: `overridable_defaults()`. A list replaces the defaults; an
+    /// empty one refuses every override keyword (API-025).
+    #[uniffi(default)]
+    pub allow_overrides: Option<Vec<Overridable>>,
+    /// Facts one transaction stages before a file database writes them in
+    /// chunks. Default 65,536; clamped to 1..=1,000,000.
+    #[uniffi(default)]
+    pub transaction_chunk_facts: Option<i64>,
+    /// Rounds one stratum of a rule query may run; more fail with INT-020.
+    /// Default 1,000,000. The maximum (i64::MAX) means no limit.
+    #[uniffi(default)]
+    pub max_iterations: Option<i64>,
 }
 
 impl OpenOptions {
@@ -190,6 +259,15 @@ impl OpenOptions {
                 to_usize(v, "query_memory_limit")?
             };
             o = o.query_memory_limit(n);
+        }
+        if let Some(list) = &self.allow_overrides {
+            o = o.allow_overrides(list.iter().map(|v| v.to_core()));
+        }
+        if let Some(v) = self.transaction_chunk_facts {
+            o = o.transaction_chunk_facts(to_usize(v, "transaction_chunk_facts")?);
+        }
+        if let Some(v) = self.max_iterations {
+            o = o.max_iterations(to_limit(v, "max_iterations")?);
         }
         Ok(o)
     }
@@ -645,6 +723,51 @@ impl MiniGrafPreparedQuery {
             vars: cursor.vars().to_vec(),
             inner: Mutex::new(Some(cursor)),
         }))
+    }
+
+    /// A new prepared query that may derive at most `n` facts; this one is
+    /// unchanged. An allowed `:max-derived-facts` or `:max-results` in the
+    /// query still overrides it. `i64::MAX` means no limit; negative is
+    /// API-017. Not gated by `OpenOptions.allow_overrides`.
+    pub fn with_max_derived_facts(
+        &self,
+        n: i64,
+    ) -> Result<Arc<MiniGrafPreparedQuery>, MiniGrafError> {
+        let n = to_limit(n, "max_derived_facts")?;
+        Ok(self.derive(|q| q.with_max_derived_facts(n)))
+    }
+
+    /// A new prepared query that may hold at most `bytes` bytes (QRY-012
+    /// beyond); this one is unchanged. `0` lets only queries that hold no
+    /// state run. Takes its argument as `with_max_derived_facts` does.
+    pub fn with_query_memory_limit(
+        &self,
+        bytes: i64,
+    ) -> Result<Arc<MiniGrafPreparedQuery>, MiniGrafError> {
+        let bytes = to_limit(bytes, "query_memory_limit")?;
+        Ok(self.derive(|q| q.with_query_memory_limit(bytes)))
+    }
+
+    /// A new prepared query whose rule strata may run at most `n` rounds
+    /// (INT-020 beyond); this one is unchanged. An allowed `:max-iterations`
+    /// in the query still overrides it. Takes its argument as
+    /// `with_max_derived_facts` does.
+    pub fn with_max_iterations(&self, n: i64) -> Result<Arc<MiniGrafPreparedQuery>, MiniGrafError> {
+        let n = to_limit(n, "max_iterations")?;
+        Ok(self.derive(|q| q.with_max_iterations(n)))
+    }
+}
+
+impl MiniGrafPreparedQuery {
+    /// A copy with `set` applied, keeping the same database open.
+    fn derive(
+        &self,
+        set: impl FnOnce(minigraf::PreparedQuery) -> minigraf::PreparedQuery,
+    ) -> Arc<MiniGrafPreparedQuery> {
+        Arc::new(MiniGrafPreparedQuery {
+            _db: self._db.clone(),
+            inner: set(self.inner.clone()),
+        })
     }
 }
 
@@ -1780,5 +1903,249 @@ mod tests {
             reason: "java.lang.IllegalStateException: no\n\tat Foo.test(Foo.kt:3)\n".into(),
         });
         assert_eq!(e.to_string(), "java.lang.IllegalStateException: no");
+    }
+
+    // ─── Overrides, open options and prepared setters (minigraf#872) ─────────
+
+    const REACH: &str = "(query [:find ?x ?y :where (reach ?x ?y)])";
+    const GROUPED: &str = "(query [:find ?v (count ?e) :where [?e :v ?v]])";
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("minigraf_ffi_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn graph(dir: &std::path::Path, name: &str) -> String {
+        dir.join(format!("{name}.graph"))
+            .to_str()
+            .expect("utf8")
+            .into()
+    }
+
+    /// A 4-edge chain (10 `reach` pairs) and 3 grouped values.
+    fn load_reach(db: &MiniGrafDb) {
+        db.execute(
+            "(transact [[:a :edge :b] [:b :edge :c] [:c :edge :d] [:d :edge :e] \
+             [:p :v 1] [:q :v 1] [:r :v 2]])"
+                .into(),
+        )
+        .expect("transact");
+        db.execute("(rule [(reach ?x ?y) [?x :edge ?y]])".into())
+            .expect("rule");
+        db.execute("(rule [(reach ?x ?y) [?x :edge ?z] (reach ?z ?y)])".into())
+            .expect("rule");
+    }
+
+    fn reach_db(dir: &std::path::Path, name: &str, options: OpenOptions) -> Arc<MiniGrafDb> {
+        let db = MiniGrafDb::open_with_options(graph(dir, name), options).expect("open");
+        load_reach(&db);
+        db
+    }
+
+    fn with_overrides(list: Option<Vec<Overridable>>) -> OpenOptions {
+        OpenOptions {
+            allow_overrides: list,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn code_of<T>(r: Result<T, MiniGrafError>) -> String {
+        msg(err(r))[1..8].to_string()
+    }
+
+    #[test]
+    fn overridable_defaults_are_the_core_defaults() {
+        assert_eq!(
+            overridable_defaults(),
+            vec![
+                Overridable::MaxDerivedFacts,
+                Overridable::MaxResults,
+                Overridable::MaxIterations
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_overrides_replaces_the_defaults() {
+        let dir = temp_dir("overrides");
+        let derived = "(query [:find ?x ?y :where (reach ?x ?y) :max-derived-facts 100])";
+        let memory = "(query [:find ?x ?y :where (reach ?x ?y) :query-memory-limit 1000000])";
+        let cases = [
+            ("absent", None, true, false),
+            ("defaults", Some(overridable_defaults()), true, false),
+            ("empty", Some(vec![]), false, false),
+            (
+                "memory",
+                Some(vec![
+                    Overridable::QueryMemoryLimit,
+                    Overridable::QueryMemoryLimit,
+                ]),
+                false,
+                true,
+            ),
+            (
+                "all",
+                Some(vec![
+                    Overridable::MaxDerivedFacts,
+                    Overridable::MaxResults,
+                    Overridable::QueryMemoryLimit,
+                    Overridable::MaxIterations,
+                ]),
+                true,
+                true,
+            ),
+        ];
+        for (name, list, derived_ok, memory_ok) in cases {
+            let db = reach_db(&dir, name, with_overrides(list));
+            for (q, ok) in [(derived, derived_ok), (memory, memory_ok)] {
+                if ok {
+                    assert_eq!(results(&db.execute(q.into()).expect(name)).len(), 10);
+                    db.query(q.into()).expect(name);
+                    db.prepare(q.into()).expect(name);
+                } else {
+                    assert_eq!(code_of(db.execute(q.into())), "API-025", "{name}");
+                    assert_eq!(code_of(db.query(q.into())), "API-025", "{name}");
+                    assert_eq!(code_of(db.prepare(q.into())), "API-025", "{name}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transaction_chunk_facts_writes_a_large_transaction() {
+        let dir = temp_dir("chunk");
+        let path = graph(&dir, "chunk");
+        let options = |n| OpenOptions {
+            transaction_chunk_facts: Some(n),
+            ..OpenOptions::default()
+        };
+        assert_eq!(code_of(options(-1).to_core()), "API-017");
+        let db = MiniGrafDb::open_with_options(path.clone(), options(2)).expect("open");
+        let facts: String = (0..10).map(|i| format!("[:e{i} :n {i}]")).collect();
+        db.execute(format!("(transact [{facts}])"))
+            .expect("transact");
+        drop(db);
+        let db = MiniGrafDb::open(path).expect("reopen");
+        let rows = db
+            .execute("(query [:find ?n :where [?e :n ?n]])".into())
+            .expect("query");
+        assert_eq!(results(&rows).len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_iterations_option_limits_rule_rounds() {
+        let dir = temp_dir("iterations");
+        let options = |n| OpenOptions {
+            max_iterations: Some(n),
+            ..OpenOptions::default()
+        };
+        assert_eq!(code_of(options(-1).to_core()), "API-017");
+        let db = reach_db(&dir, "default", OpenOptions::default());
+        assert_eq!(
+            results(&db.execute(REACH.into()).expect("default")).len(),
+            10
+        );
+        let db = reach_db(&dir, "one", options(1));
+        assert_eq!(code_of(db.execute(REACH.into())), "INT-020");
+        let db = reach_db(&dir, "max", options(i64::MAX));
+        assert_eq!(
+            results(&db.execute(REACH.into()).expect("no limit")).len(),
+            10
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_writer_accepts_the_new_options() {
+        let dir = temp_dir("writer_options");
+        let out = graph(&dir, "out");
+        let options = OpenOptions {
+            allow_overrides: Some(vec![]),
+            transaction_chunk_facts: Some(2),
+            max_iterations: Some(5),
+            ..OpenOptions::default()
+        };
+        let w = MiniGrafLogWriter::create(out.clone(), options).expect("create");
+        w.finish().expect("finish");
+        assert!(std::path::Path::new(&out).exists());
+        let bad = OpenOptions {
+            max_iterations: Some(-1),
+            ..OpenOptions::default()
+        };
+        assert_eq!(
+            code_of(MiniGrafLogWriter::create(graph(&dir, "bad"), bad)),
+            "API-017"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepared_setters_derive_new_queries() {
+        let dir = temp_dir("setters");
+        // The setters are not gated: every override keyword is refused here.
+        let db = reach_db(&dir, "setters", with_overrides(Some(vec![])));
+        let none = HashMap::new;
+        let pq = db.prepare(REACH.into()).expect("prepare");
+        let mut cursor_rows = 0;
+        let cursor = pq.query(none()).expect("cursor");
+        for derived in [
+            pq.with_max_derived_facts(1).expect("setter"),
+            pq.with_max_iterations(1).expect("setter"),
+        ] {
+            assert_eq!(code_of(derived.execute(none())), "INT-020");
+            assert_eq!(code_of(derived.query(none())), "INT-020");
+        }
+        // Deriving did not disturb a cursor open on the receiver.
+        while let Some(batch) = cursor.next_batch(3).expect("batch") {
+            cursor_rows += serde_json::from_str::<Vec<serde_json::Value>>(&batch)
+                .expect("rows")
+                .len();
+        }
+        assert_eq!(cursor_rows, 10);
+        assert_eq!(results(&pq.execute(none()).expect("receiver")).len(), 10);
+
+        let grouped = db.prepare(GROUPED.into()).expect("prepare");
+        let small = grouped.with_query_memory_limit(16).expect("setter");
+        assert_eq!(code_of(small.execute(none())), "QRY-012");
+        assert_eq!(
+            results(&grouped.execute(none()).expect("receiver")).len(),
+            2
+        );
+        let unlimited = small.with_query_memory_limit(i64::MAX).expect("setter");
+        assert_eq!(
+            results(&unlimited.execute(none()).expect("no limit")).len(),
+            2
+        );
+
+        // The last value for a limit applies; the others are kept.
+        let chained = pq
+            .with_max_derived_facts(1)
+            .and_then(|q| q.with_max_iterations(1))
+            .and_then(|q| q.with_max_iterations(i64::MAX))
+            .expect("setters");
+        assert_eq!(code_of(chained.execute(none())), "INT-020");
+        let raised = chained.with_max_derived_facts(i64::MAX).expect("setter");
+        assert_eq!(results(&raised.execute(none()).expect("raised")).len(), 10);
+
+        for r in [
+            pq.with_max_derived_facts(-1),
+            pq.with_query_memory_limit(-1),
+            pq.with_max_iterations(-1),
+        ] {
+            assert_eq!(code_of(r), "API-017");
+        }
+        // A derived query keeps its database open.
+        let derived = pq.with_max_iterations(10).expect("setter");
+        drop(pq);
+        drop(db);
+        assert_eq!(
+            results(&derived.execute(none()).expect("db alive")).len(),
+            10
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
