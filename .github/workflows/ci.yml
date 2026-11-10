@@ -42,7 +42,7 @@ jobs:
   consumer:
     name: Consumer test (iOS simulator)
     needs: package
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,7 +58,7 @@ jobs:
   # Tests/swift/main.swift against a macOS build of the shim.
   swift-test:
     name: Swift bindings test (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
