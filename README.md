@@ -214,7 +214,7 @@ _ = try db.execute(datalog: "(query [:find ?a (product ?a :over (:order-by ?a)) 
 A write transaction stages several `transact`, `retract` and `query` statements, with
 queries seeing what it staged, and then commits them as one transaction or rolls them
 back (minigraf#824). First in the release built on core v3.0.0 (core commit
-`CORE_COMMIT`).
+`639e7382`).
 
 ```swift
 let db = try MiniGrafDb.open(path: "bank.graph")
