@@ -2751,4 +2751,28 @@ mod tests {
         tx.commit().expect("query only");
         assert_eq!(db.current_tx_count().expect("count"), before);
     }
+
+    #[test]
+    fn tx_keeps_its_database_open() {
+        let dir = temp_dir("tx_keeps_open");
+        let path = graph(&dir, "g");
+        let tx = {
+            let db = MiniGrafDb::open(path.clone()).expect("open");
+            db.execute(TX_SETUP.into()).expect("setup");
+            let tx = db.begin_write().expect("begin");
+            tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+                .expect("transact");
+            tx
+            // Every MiniGrafDb reference is dropped here.
+        };
+        tx.execute(r#"(transact [[:dave :person/name "Dave"]])"#.into())
+            .expect("the transaction still runs");
+        tx.commit()
+            .expect("commit after the database object is gone");
+        drop(tx);
+        let db = MiniGrafDb::open(path).expect("reopen");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol", "Dave"]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
