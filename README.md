@@ -209,6 +209,48 @@ _ = try db.execute(datalog: "(query [:find ?a (product ?a :over (:order-by ?a)) 
   function. Inside a write transaction, the calls the core refuses there still return
   `INT-001`.
 
+## Write transactions
+
+A write transaction stages several `transact`, `retract` and `query` statements, with
+queries seeing what it staged, and then commits them as one transaction or rolls them
+back (minigraf#824). First in the release built on core v3.0.0 (core commit
+`CORE_COMMIT`).
+
+```swift
+let db = try MiniGrafDb.open(path: "bank.graph")
+_ = try db.execute(datalog: "(transact [[:alice :balance 100] [:bob :balance 50]])")
+
+// The closure form rolls back when the closure throws or returns without commit().
+try db.withWriteTransaction(options: TxOptions(chunkFacts: 10_000)) { tx in
+    _ = try tx.execute(datalog: "(transact [[:alice :balance 70] [:bob :balance 80]])")
+    _ = try tx.execute(datalog: "(retract [[:alice :balance 100] [:bob :balance 50]])")
+    try tx.commit()
+}
+```
+
+- `db.beginWrite()` or `db.beginWrite(options: TxOptions(...))` returns a
+  `MiniGrafWriteTransaction` to end yourself; `withWriteTransaction` runs a closure and
+  returns its result. An option left `nil` is the database's: `synchronous`
+  (`.full` / `.normal`) is this commit's WAL sync, `chunkFacts` the facts staged before
+  a file database writes the transaction in chunks (negative is API-017). Read-only
+  databases throw API-014.
+- `tx.execute(datalog:)` returns what `db.execute` returns; a staged write returns
+  `{"ok":true}`. A statement that fails stages nothing and leaves the transaction open.
+  There are no cursors or prepared queries inside a transaction.
+- `tx.commit()` applies everything as one transaction; a commit that fails rolls back.
+  `tx.rollback()` discards it. Either way it is finished: `execute` and `commit` then
+  throw API-018, and `rollback` does nothing.
+- Commit is always explicit. A transaction released while open rolls back; ARC releases
+  it when the last reference goes, but end it yourself rather than rely on that.
+- An open transaction holds the database's write lock until it finishes, so end every
+  transaction explicitly or through `withWriteTransaction`. On the thread that began it, database
+  calls (`execute`, `query`, `prepare`, `factLog`, `checkpoint`, another `beginWrite`, prepared queries) fail with INT-001, and so do user functions its statements run. On
+  other threads, writes and begins wait until it ends; queries read the committed
+  state. Use a transaction on the thread that began it: a thread that uses one it did
+  not begin and then writes through the database waits on that transaction.
+- Rules registered inside a transaction stay registered after a rollback.
+- The transaction keeps its database open until it is released.
+
 ## Building from source
 
 Requires Rust stable toolchain with iOS targets and Xcode.
