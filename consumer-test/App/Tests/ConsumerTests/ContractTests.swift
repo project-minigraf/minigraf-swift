@@ -115,6 +115,34 @@ final class ContractTests: XCTestCase {
         XCTAssertEqual(try rows(pq.execute([:])).count, 6)
     }
 
+    // minigraf#824: write transactions through the package.
+    func testWriteTransactions() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("tx.graph").path
+        let names = "(query [:find ?n :where [?e :name ?n]])"
+        do {
+            let db = try MiniGrafDb.open(path: path)
+            _ = try db.execute(datalog: #"(transact [[:alice :name "Alice"]])"#)
+            let tx = try db.beginWrite(options: TxOptions(chunkFacts: 1000))
+            _ = try tx.execute(datalog: #"(transact [[:bob :name "Bob"]])"#)
+            XCTAssertEqual(try rows(tx.execute(datalog: names)).count, 2, "the transaction reads its own write")
+            try tx.commit()
+            XCTAssertThrowsError(try tx.execute(datalog: names)) { error in
+                XCTAssertTrue((error as? MiniGrafError)?.message.hasPrefix("[API-018]") ?? false, "\(error)")
+            }
+            struct Leave: Error {}
+            XCTAssertThrowsError(try db.withWriteTransaction { t in
+                _ = try t.execute(datalog: #"(transact [[:carol :name "Carol"]])"#)
+                throw Leave()
+            })
+            XCTAssertEqual(try rows(db.execute(datalog: names)).count, 2, "a throw rolls back")
+        }
+        let reopened = try MiniGrafDb.open(path: path)
+        XCTAssertEqual(try rows(reopened.execute(datalog: names)).count, 2, "the commit survives reopen")
+    }
+
     func testErrorType() throws {
         let db = try MiniGrafDb.openInMemory()
         XCTAssertThrowsError(try db.execute(datalog: "(nosuchcommand [])")) { error in

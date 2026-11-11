@@ -477,6 +477,53 @@ do {
     check(rows(try chained.withMaxDerivedFacts(n: Int64.max).execute([:])) == 10, "last value applies")
 }
 
+// Write transactions (minigraf#824)
+do {
+    let names = "(query [:find ?n :where [?e :person/name ?n]])"
+    func namesOf(_ json: String) -> [String] {
+        let v = try! JSONSerialization.jsonObject(with: Data(json.utf8)) as! [String: Any]
+        return (v["results"] as! [[Any]]).map { $0[0] as! String }.sorted()
+    }
+    let p = path("tx.graph")
+    do {
+        let db = try MiniGrafDb.open(path: p)
+        _ = try db.execute(datalog: "(transact [[:alice :person/name \"Alice\"] [:bob :person/name \"Bob\"]])")
+        let tx = try db.beginWrite()
+        check(try tx.execute(datalog: "(transact [[:carol :person/name \"Carol\"]])") == "{\"ok\":true}", "staged ok")
+        _ = try tx.execute(datalog: "(retract [[:bob :person/name \"Bob\"]])")
+        check(namesOf(try tx.execute(datalog: names)) == ["Alice", "Carol"], "read your own writes")
+        check(errorText { _ = try db.execute(datalog: names) }.hasPrefix("[INT-001]"), "INT-001 on the begin thread")
+        try tx.commit()
+        check(!tx.isOpen(), "finished")
+        check(errorText { _ = try tx.execute(datalog: names) }.hasPrefix("[API-018]"), "API-018 execute")
+        check(errorText { try tx.commit() }.hasPrefix("[API-018]"), "API-018 commit")
+        try tx.rollback()
+
+        try db.withWriteTransaction { t in
+            _ = try t.execute(datalog: "(transact [[:dave :person/name \"Dave\"]])")
+        }
+        check(namesOf(try db.execute(datalog: names)) == ["Alice", "Carol"], "no commit on return")
+        struct Boom: Error {}
+        do {
+            try db.withWriteTransaction { t in
+                _ = try t.execute(datalog: "(transact [[:erin :person/name \"Erin\"]])")
+                throw Boom()
+            }
+            check(false, "the throw passes through")
+        } catch is Boom {}
+        check(namesOf(try db.execute(datalog: names)) == ["Alice", "Carol"], "rolled back on a throw")
+        let n = try db.withWriteTransaction(options: TxOptions(synchronous: .normal, chunkFacts: 2)) { t -> Int in
+            for i in 0..<5 { _ = try t.execute(datalog: "(transact [[:p\(i) :person/name \"P\(i)\"]])") }
+            try t.commit()
+            return 5
+        }
+        check(n == 5, "the closure's result")
+        check(errorText { _ = try db.beginWrite(options: TxOptions(chunkFacts: -1)) }.hasPrefix("[API-017]"), "negative chunkFacts")
+    }
+    let again = try MiniGrafDb.open(path: p)
+    check(namesOf(try again.execute(datalog: names)).count == 7, "commits survive reopen")
+}
+
 try? FileManager.default.removeItem(at: dir)
 if failures > 0 {
     print("\(failures) check(s) failed")

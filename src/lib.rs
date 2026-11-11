@@ -937,6 +937,123 @@ impl MiniGrafLogWriter {
     }
 }
 
+// ─── Write transactions ──────────────────────────────────────────────────────
+
+/// Options for `MiniGrafDb.begin_write_with`. Every field is optional; an
+/// absent field is the database's value. See the Rust `TxOptions`.
+#[derive(Debug, Clone, Default, uniffi::Record)]
+pub struct TxOptions {
+    /// This transaction's WAL durability. Absent: the database's
+    /// `OpenOptions.synchronous`. No effect in memory or on a transaction
+    /// that becomes large, which commits as a checkpoint.
+    #[uniffi(default)]
+    pub synchronous: Option<SyncMode>,
+    /// Facts this transaction stages before a file database writes them in
+    /// chunks. Absent: the database's `transaction_chunk_facts`. Clamped to
+    /// 1..=1,000,000; negative is API-017.
+    #[uniffi(default)]
+    pub chunk_facts: Option<i64>,
+}
+
+impl TxOptions {
+    fn to_core(&self) -> Result<minigraf::TxOptions, MiniGrafError> {
+        let mut o = minigraf::TxOptions::new();
+        if let Some(v) = self.synchronous {
+            o = o.synchronous(match v {
+                SyncMode::Full => minigraf::SyncMode::Full,
+                SyncMode::Normal => minigraf::SyncMode::Normal,
+            });
+        }
+        if let Some(v) = self.chunk_facts {
+            o = o.chunk_facts(to_usize(v, "chunk_facts")?);
+        }
+        Ok(o)
+    }
+}
+
+#[uniffi::export]
+impl MiniGrafDb {
+    /// Begin a write transaction with the database's options. See
+    /// `MiniGrafWriteTransaction`.
+    pub fn begin_write(&self) -> Result<Arc<MiniGrafWriteTransaction>, MiniGrafError> {
+        self.begin_write_with(TxOptions::default())
+    }
+
+    /// Begin a write transaction with `options`. It holds the database's
+    /// write lock until it commits, rolls back or is freed: a write or a
+    /// begin from another thread waits until then (this one included, while
+    /// another transaction is open), and a query from another thread reads
+    /// the committed state. On this thread, `execute`, `query`, `fact_log`,
+    /// `prepare`, `checkpoint`, a begin and a prepared query's runs fail
+    /// with INT-001 until it finishes. API-014 on a read-only database.
+    pub fn begin_write_with(
+        &self,
+        options: TxOptions,
+    ) -> Result<Arc<MiniGrafWriteTransaction>, MiniGrafError> {
+        let options = options.to_core()?;
+        // No binding lock is held while the begin waits for the write lock.
+        let tx = self.db()?.begin_write_owned_with(options)?;
+        Ok(Arc::new(MiniGrafWriteTransaction {
+            inner: Mutex::new(Some(tx)),
+        }))
+    }
+}
+
+/// A write transaction from `MiniGrafDb.begin_write`.
+///
+/// `execute` runs one statement inside it: a `transact`/`retract` is staged
+/// and returns `{"ok":true}`, a `query` reads the committed facts plus the
+/// staged ones, and a `rule` is registered at once (a rollback keeps it). A
+/// statement that fails stages nothing and leaves the transaction open.
+/// `commit` applies everything as one transaction; `rollback` discards it.
+///
+/// Once it committed (or failed to) or rolled back, it is finished: `execute` and `commit` fail with API-018, and `rollback` and
+/// freeing it do nothing. Freed while open, it rolls back. Each call runs
+/// whole: one used from two threads at once runs their calls one after the
+/// other. It may be used and finished on any thread; INT-001 stays on the
+/// thread that began it. It keeps its database open until it is freed.
+#[derive(uniffi::Object)]
+pub struct MiniGrafWriteTransaction {
+    /// `None` once finished.
+    inner: Mutex<Option<minigraf::OwnedWriteTransaction>>,
+}
+
+#[uniffi::export]
+impl MiniGrafWriteTransaction {
+    /// Run one Datalog command inside the transaction. Returns the JSON
+    /// `MiniGrafDb.execute` returns for the same core result.
+    pub fn execute(&self, datalog: String) -> Result<String, MiniGrafError> {
+        let mut guard = lock(&self.inner)?;
+        let tx = guard.as_mut().ok_or_else(finished)?;
+        Ok(query_result_to_json(tx.execute(&datalog)?))
+    }
+
+    /// Commit every staged change as one transaction. A commit that fails
+    /// rolls the transaction back; either way it is finished.
+    pub fn commit(&self) -> Result<(), MiniGrafError> {
+        let tx = lock(&self.inner)?.take().ok_or_else(finished)?;
+        Ok(tx.commit()?)
+    }
+
+    /// Discard every staged change. Does nothing on a finished transaction.
+    pub fn rollback(&self) -> Result<(), MiniGrafError> {
+        if let Some(tx) = lock(&self.inner)?.take() {
+            tx.rollback();
+        }
+        Ok(())
+    }
+
+    /// Whether the transaction is still open.
+    pub fn is_open(&self) -> bool {
+        self.inner.lock().is_ok_and(|g| g.is_some())
+    }
+}
+
+/// API-018: a call on a finished transaction.
+fn finished() -> MiniGrafError {
+    minigraf::MinigrafError::closed("write transaction").into()
+}
+
 // ─── JSON serialisation (internal helpers) ───────────────────────────────────
 
 fn rows_to_json(rows: &[Vec<Value>]) -> String {
@@ -2146,6 +2263,516 @@ mod tests {
             results(&derived.execute(none()).expect("db alive")).len(),
             10
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Write transactions (minigraf#824) ────────────────────────────────────
+
+    const NAMES: &str = "(query [:find ?n :where [?e :person/name ?n]])";
+    const TX_SETUP: &str =
+        r#"(transact [[:alice :person/name "Alice"] [:bob :person/name "Bob"]])"#;
+
+    /// The sorted names a query JSON returns.
+    fn names_of(json: &str) -> Vec<String> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("json");
+        let mut names: Vec<String> = v["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|r| r[0].as_str().expect("a name").to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn db_names(db: &MiniGrafDb) -> Vec<String> {
+        names_of(&db.execute(NAMES.into()).expect("query"))
+    }
+
+    /// The `XXX-NNN` code an error message carries.
+    fn code(e: &MiniGrafError) -> String {
+        let s = e.to_string();
+        let start = s.find('[').map_or(0, |i| i + 1);
+        s[start..].chars().take(7).collect()
+    }
+
+    fn tx_db() -> Arc<MiniGrafDb> {
+        let db = MiniGrafDb::open_in_memory().expect("open");
+        db.execute(TX_SETUP.into()).expect("setup");
+        db
+    }
+
+    /// Run `f` on a new thread; `Some` of its result if it returns within `t`.
+    fn within<T: Send + 'static>(
+        t: std::time::Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> (Option<T>, std::sync::mpsc::Receiver<T>) {
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(f());
+        });
+        match recv.recv_timeout(t) {
+            Ok(v) => (Some(v), recv),
+            Err(_) => (None, recv),
+        }
+    }
+
+    const WAITS: std::time::Duration = std::time::Duration::from_millis(300);
+    const STUCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[test]
+    fn tx_reads_its_own_writes_and_commits() {
+        let dir = temp_dir("tx_commit");
+        let path = graph(&dir, "g");
+        {
+            let db = MiniGrafDb::open(path.clone()).expect("open");
+            db.execute(TX_SETUP.into()).expect("setup");
+            let tx = db.begin_write().expect("begin");
+            assert_eq!(
+                tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+                    .expect("transact"),
+                r#"{"ok":true}"#
+            );
+            assert_eq!(
+                tx.execute(r#"(retract [[:bob :person/name "Bob"]])"#.into())
+                    .expect("retract"),
+                r#"{"ok":true}"#
+            );
+            assert_eq!(
+                names_of(&tx.execute(NAMES.into()).expect("query in tx")),
+                ["Alice", "Carol"]
+            );
+            // Another thread reads the committed state meanwhile.
+            let db2 = db.clone();
+            let (outside, _) = within(STUCK, move || db_names(&db2));
+            assert_eq!(outside.expect("a query does not wait"), ["Alice", "Bob"]);
+            tx.commit().expect("commit");
+            assert_eq!(db_names(&db), ["Alice", "Carol"]);
+            assert!(!tx.is_open());
+        }
+        let db = MiniGrafDb::open(path).expect("reopen");
+        assert_eq!(db_names(&db), ["Alice", "Carol"], "after reopening");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_rollback_leaves_the_database_as_it_was() {
+        let dir = temp_dir("tx_rollback");
+        let path = graph(&dir, "g");
+        {
+            let db = MiniGrafDb::open(path.clone()).expect("open");
+            db.execute(TX_SETUP.into()).expect("setup");
+            let tx = db.begin_write().expect("begin");
+            tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+                .expect("transact");
+            tx.execute(r#"(retract [[:bob :person/name "Bob"]])"#.into())
+                .expect("retract");
+            tx.rollback().expect("rollback");
+            assert_eq!(db_names(&db), ["Alice", "Bob"]);
+        }
+        let db = MiniGrafDb::open(path).expect("reopen");
+        assert_eq!(db_names(&db), ["Alice", "Bob"], "after reopening");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_failed_statement_stages_nothing_and_stays_open() {
+        let db = tx_db();
+        let tx = db.begin_write().expect("begin");
+        let parse = tx.execute("(transact [[:a".into()).expect_err("parse");
+        assert_eq!(code(&parse), "PRS-004");
+        let windows = tx
+            .execute(
+                r#"(transact [[:x :p/v 1 {:valid-from "2020-01-01T00:00:00Z"}]
+                    [:x :p/v 1 {:valid-from "2021-01-01T00:00:00Z"}]])"#
+                    .into(),
+            )
+            .expect_err("two windows of a triple");
+        assert_eq!(code(&windows), "API-011");
+        tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("still open");
+        tx.commit().expect("commit");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol"]);
+    }
+
+    #[test]
+    fn tx_finished_is_api018() {
+        let db = tx_db();
+        let committed = db.begin_write().expect("begin");
+        committed.commit().expect("commit");
+        let rolled_back = db.begin_write().expect("begin");
+        rolled_back.rollback().expect("rollback");
+        for tx in [&committed, &rolled_back] {
+            assert_eq!(
+                code(&tx.execute(NAMES.into()).expect_err("execute")),
+                "API-018"
+            );
+            assert_eq!(code(&tx.commit().expect_err("commit")), "API-018");
+            tx.rollback().expect("rollback does nothing");
+        }
+
+        // A commit that fails finishes the transaction: a valid-time window
+        // still ahead when staged has ended at the commit time (API-019).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs();
+        let end = now + 2;
+        let tx = db.begin_write().expect("begin");
+        tx.execute(format!(
+            "(transact [[:dave :person/name \"Dave\" {{:valid-to {}}}]])",
+            rfc3339(end)
+        ))
+        .expect("the window is ahead when staged");
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs()
+            <= end
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(code(&tx.commit().expect_err("ended")), "API-019");
+        assert_eq!(
+            code(&tx.execute(NAMES.into()).expect_err("finished")),
+            "API-018"
+        );
+        db.execute(r#"(transact [[:erin :person/name "Erin"]])"#.into())
+            .expect("the failed commit released the write lock");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Erin"]);
+    }
+
+    /// `secs` since the epoch as an RFC 3339 UTC string (whole seconds).
+    fn rfc3339(secs: u64) -> String {
+        let days = secs / 86_400;
+        let rem = secs % 86_400;
+        // Civil-from-days (Howard Hinnant), for 1970 onwards.
+        let z = days + 719_468;
+        let era = z / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + u64::from(m <= 2);
+        format!(
+            "\"{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z\"",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
+    /// After `release` on another thread, writes through the database
+    /// succeed from that thread and from this one.
+    fn assert_lock_released(db: &Arc<MiniGrafDb>, what: &str) {
+        let db2 = db.clone();
+        let (other, _) = within(STUCK, move || {
+            db2.execute(r#"(transact [[:t :p/n "other thread"]])"#.into())
+                .map(|_| ())
+        });
+        assert!(
+            other.expect("not stuck").is_ok(),
+            "{what}: another thread writes"
+        );
+        db.execute(r#"(transact [[:t :p/n "this thread"]])"#.into())
+            .unwrap_or_else(|_| panic!("{what}: the begin thread writes"));
+    }
+
+    #[test]
+    fn tx_dropped_open_rolls_back_and_releases_the_lock() {
+        let db = tx_db();
+        // Dropped on the begin thread.
+        let tx = db.begin_write().expect("begin");
+        tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("transact");
+        drop(tx);
+        assert_eq!(db_names(&db), ["Alice", "Bob"]);
+        assert_lock_released(&db, "dropped on the begin thread");
+
+        // The last reference dropped on another thread, as a collector does.
+        let tx = db.begin_write().expect("begin");
+        tx.execute(r#"(transact [[:dave :person/name "Dave"]])"#.into())
+            .expect("transact");
+        std::thread::spawn(move || drop(tx)).join().expect("join");
+        assert_eq!(db_names(&db), ["Alice", "Bob"]);
+        assert_lock_released(&db, "dropped on another thread");
+    }
+
+    #[test]
+    fn tx_guards_the_begin_thread_and_others_wait() {
+        let dir = temp_dir("tx_guard");
+        let db = MiniGrafDb::open(graph(&dir, "g")).expect("open");
+        db.execute(TX_SETUP.into()).expect("setup");
+        let pq = db.prepare(NAMES.into()).expect("prepare");
+        let tx = db.begin_write().expect("begin");
+        tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("transact");
+
+        let refused: Vec<(&str, Result<(), MiniGrafError>)> = vec![
+            ("execute", db.execute(NAMES.into()).map(|_| ())),
+            ("query", db.query(NAMES.into()).map(|_| ())),
+            ("prepare", db.prepare(NAMES.into()).map(|_| ())),
+            ("fact_log", db.fact_log(FactFilter::default()).map(|_| ())),
+            ("checkpoint", db.checkpoint()),
+            ("begin_write", db.begin_write().map(|_| ())),
+            ("prepared execute", pq.execute(HashMap::new()).map(|_| ())),
+        ];
+        for (name, result) in refused {
+            let err = result.expect_err(name);
+            assert_eq!(code(&err), "INT-001", "{name} on the begin thread");
+        }
+
+        // A write and a begin from another thread wait; a query does not,
+        // also while a begin is waiting.
+        let db2 = db.clone();
+        let (early_write, write) = within(WAITS, move || {
+            db2.execute(r#"(transact [[:w :person/name "W"]])"#.into())
+                .map(|_| ())
+        });
+        assert!(early_write.is_none(), "a write from another thread waits");
+        let db3 = db.clone();
+        let (early_begin, begin) = within(WAITS, move || {
+            let tx = db3.begin_write()?;
+            tx.execute(r#"(transact [[:b :person/name "B"]])"#.into())?;
+            tx.commit()
+        });
+        assert!(early_begin.is_none(), "a begin from another thread waits");
+        let db4 = db.clone();
+        let (query, _) = within(STUCK, move || db_names(&db4));
+        assert_eq!(
+            query.expect("a query runs while a begin waits"),
+            ["Alice", "Bob"]
+        );
+
+        tx.commit().expect("commit");
+        write
+            .recv_timeout(STUCK)
+            .expect("the write ends")
+            .expect("it succeeds");
+        begin
+            .recv_timeout(STUCK)
+            .expect("the begin ends")
+            .expect("it succeeds");
+        assert_eq!(db_names(&db), ["Alice", "B", "Bob", "Carol", "W"]);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tx_used_from_several_threads() {
+        let db = tx_db();
+        let tx = db.begin_write().expect("begin");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        tx.execute(format!("(transact [[:t{i}_{j} :p/n {j}]])"))
+                            .expect("a whole statement");
+                        tx.execute("(query [:find (count ?e) :where [?e :p/n _]])".into())
+                            .expect("a whole query");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Committed on another thread than the one that began it.
+        let tx2 = tx.clone();
+        std::thread::spawn(move || tx2.commit())
+            .join()
+            .expect("join")
+            .expect("commit");
+        let count = db
+            .execute("(query [:find (count ?e) :where [?e :p/n _]])".into())
+            .expect("count");
+        assert!(count.contains("[[160]]"), "every statement committed");
+        assert_lock_released(&db, "committed on another thread");
+
+        // A call racing a commit either runs before it or fails with API-018.
+        let tx = db.begin_write().expect("begin");
+        let racers: Vec<_> = (0..4)
+            .map(|i| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    (0..50)
+                        .map(|j| tx.execute(format!("(transact [[:r{i}_{j} :p/r {j}]])")))
+                        .filter_map(Result::err)
+                        .map(|e| code(&e))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        tx.commit().expect("commit");
+        for r in racers {
+            for c in r.join().expect("join") {
+                assert_eq!(c, "API-018", "a call that loses the race");
+            }
+        }
+        assert_lock_released(&db, "after the race");
+    }
+
+    #[test]
+    fn tx_options_and_read_only() {
+        let dir = temp_dir("tx_options");
+        let path = graph(&dir, "g");
+        {
+            let db = MiniGrafDb::open(path.clone()).expect("open");
+            db.execute(TX_SETUP.into()).expect("setup");
+            let err = db
+                .begin_write_with(TxOptions {
+                    synchronous: None,
+                    chunk_facts: Some(-1),
+                })
+                .err()
+                .expect("negative chunk_facts");
+            assert_eq!(code(&err), "API-017");
+            // A small chunk: the transaction becomes large and commits as a
+            // checkpoint.
+            let tx = db
+                .begin_write_with(TxOptions {
+                    synchronous: Some(SyncMode::Normal),
+                    chunk_facts: Some(3),
+                })
+                .expect("begin");
+            for i in 0..4 {
+                tx.execute(format!(
+                    "(transact [[:c{i}a :person/name \"C{i}a\"] [:c{i}b :person/name \"C{i}b\"]])"
+                ))
+                .expect("transact");
+            }
+            assert_eq!(
+                names_of(&tx.execute(NAMES.into()).expect("query")).len(),
+                10
+            );
+            tx.commit().expect("commit");
+            let tx = db
+                .begin_write_with(TxOptions {
+                    synchronous: Some(SyncMode::Full),
+                    chunk_facts: None,
+                })
+                .expect("begin");
+            tx.execute(r#"(transact [[:f :person/name "F"]])"#.into())
+                .expect("transact");
+            tx.commit().expect("commit");
+        }
+        {
+            let db = MiniGrafDb::open(path.clone()).expect("reopen");
+            assert_eq!(db_names(&db).len(), 11, "every fact after reopening");
+        }
+        let ro = MiniGrafDb::open_with_options(
+            path,
+            OpenOptions {
+                read_only: Some(true),
+                ..OpenOptions::default()
+            },
+        )
+        .expect("read-only");
+        assert_eq!(code(&ro.begin_write().err().expect("read-only")), "API-014");
+        assert_eq!(db_names(&ro).len(), 11, "still readable");
+        let mem = MiniGrafDb::open_in_memory().expect("open");
+        mem.begin_write_with(TxOptions {
+            synchronous: Some(SyncMode::Normal),
+            chunk_facts: Some(1),
+        })
+        .expect("in memory, accepted and ignored")
+        .commit()
+        .expect("commit");
+        drop(ro);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct SeesStaged;
+    impl MiniGrafPredicate for SeesStaged {
+        fn test(&self, value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            Ok(value
+                == MiniGrafValue::Text {
+                    value: "Carol".into(),
+                })
+        }
+    }
+
+    struct CallsBack(Arc<MiniGrafDb>);
+    impl MiniGrafPredicate for CallsBack {
+        fn test(&self, _value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            self.0
+                .execute(NAMES.into())
+                .map(|_| true)
+                .map_err(|e| MiniGrafUdfError::Failed { msg: e.to_string() })
+        }
+    }
+
+    #[test]
+    fn tx_user_functions() {
+        let db = tx_db();
+        db.register_predicate("staged?".into(), Arc::new(SeesStaged))
+            .expect("register");
+        db.register_predicate("calls-back?".into(), Arc::new(CallsBack(db.clone())))
+            .expect("register");
+        let tx = db.begin_write().expect("begin");
+        tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("transact");
+        let seen = tx
+            .execute("(query [:find ?n :where [?e :person/name ?n] [(staged? ?n)]])".into())
+            .expect("a user function sees staged values");
+        assert_eq!(names_of(&seen), ["Carol"]);
+        let err = tx
+            .execute("(query [:find ?n :where [?e :person/name ?n] [(calls-back? ?n)]])".into())
+            .expect_err("a guarded call from inside the transaction");
+        assert_eq!(code(&err), "QRY-014");
+        assert!(err.to_string().contains("INT-001"), "the cause is INT-001");
+        tx.commit().expect("the transaction still commits");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol"]);
+    }
+
+    #[test]
+    fn tx_rules_stay_after_rollback() {
+        let db = tx_db();
+        let tx = db.begin_write().expect("begin");
+        tx.execute("(rule [(named ?e ?n) [?e :person/name ?n]])".into())
+            .expect("rule");
+        tx.rollback().expect("rollback");
+        let r = db
+            .execute("(query [:find ?n :where (named ?e ?n)])".into())
+            .expect("the rule is still registered");
+        assert_eq!(names_of(&r), ["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn tx_empty_and_query_only() {
+        let db = tx_db();
+        let before = db.current_tx_count().expect("count");
+        db.begin_write().expect("begin").commit().expect("empty");
+        let tx = db.begin_write().expect("begin");
+        tx.execute(NAMES.into()).expect("query");
+        tx.commit().expect("query only");
+        assert_eq!(db.current_tx_count().expect("count"), before);
+    }
+
+    #[test]
+    fn tx_keeps_its_database_open() {
+        let dir = temp_dir("tx_keeps_open");
+        let path = graph(&dir, "g");
+        let tx = {
+            let db = MiniGrafDb::open(path.clone()).expect("open");
+            db.execute(TX_SETUP.into()).expect("setup");
+            let tx = db.begin_write().expect("begin");
+            tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+                .expect("transact");
+            tx
+            // Every MiniGrafDb reference is dropped here.
+        };
+        tx.execute(r#"(transact [[:dave :person/name "Dave"]])"#.into())
+            .expect("the transaction still runs");
+        tx.commit()
+            .expect("commit after the database object is gone");
+        drop(tx);
+        let db = MiniGrafDb::open(path).expect("reopen");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol", "Dave"]);
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
