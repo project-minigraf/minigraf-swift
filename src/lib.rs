@@ -995,6 +995,7 @@ impl MiniGrafDb {
         let tx = self.db()?.begin_write_owned_with(options)?;
         Ok(Arc::new(MiniGrafWriteTransaction {
             inner: Mutex::new(Some(tx)),
+            running: Mutex::new(None),
         }))
     }
 }
@@ -1012,10 +1013,51 @@ impl MiniGrafDb {
 /// whole: one used from two threads at once runs their calls one after the
 /// other. It may be used and finished on any thread; INT-001 stays on the
 /// thread that began it. It keeps its database open until it is freed.
+///
+/// A user function cannot call the transaction whose statement it runs in:
+/// there `execute`, `commit` and `rollback` fail with INT-001 and change
+/// nothing, and `is_open` is true.
 #[derive(uniffi::Object)]
 pub struct MiniGrafWriteTransaction {
     /// `None` once finished.
     inner: Mutex<Option<minigraf::OwnedWriteTransaction>>,
+    /// The thread running a statement of this transaction, which holds
+    /// `inner` meanwhile. A call from that thread comes from a user function
+    /// of the statement and would wait for `inner` forever (minigraf#886).
+    running: Mutex<Option<std::thread::ThreadId>>,
+}
+
+/// Clears `MiniGrafWriteTransaction::running` when the statement ends, also
+/// by a panic.
+struct Running<'a>(&'a Mutex<Option<std::thread::ThreadId>>);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl MiniGrafWriteTransaction {
+    /// Whether this thread is running a statement of this transaction. Only
+    /// the thread that set `running` can read its own id there, so the answer
+    /// cannot change under the caller.
+    fn in_own_statement(&self) -> bool {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) == Some(std::thread::current().id())
+    }
+
+    /// INT-001 for a call from a user function of this transaction's running
+    /// statement. Checked before `inner` is locked: another thread's call
+    /// passes and waits for the statement.
+    fn refuse_own_statement(&self) -> Result<(), MiniGrafError> {
+        if self.in_own_statement() {
+            return Err(MiniGrafError::Other {
+                msg: "[INT-001] a write transaction is already in progress on this thread; \
+                      a user function cannot call the transaction it runs in"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[uniffi::export]
@@ -1023,20 +1065,26 @@ impl MiniGrafWriteTransaction {
     /// Run one Datalog command inside the transaction. Returns the JSON
     /// `MiniGrafDb.execute` returns for the same core result.
     pub fn execute(&self, datalog: String) -> Result<String, MiniGrafError> {
+        self.refuse_own_statement()?;
         let mut guard = lock(&self.inner)?;
         let tx = guard.as_mut().ok_or_else(finished)?;
+        // Declared after `guard`, so cleared before `inner` is released.
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+        let _running = Running(&self.running);
         Ok(query_result_to_json(tx.execute(&datalog)?))
     }
 
     /// Commit every staged change as one transaction. A commit that fails
     /// rolls the transaction back; either way it is finished.
     pub fn commit(&self) -> Result<(), MiniGrafError> {
+        self.refuse_own_statement()?;
         let tx = lock(&self.inner)?.take().ok_or_else(finished)?;
         Ok(tx.commit()?)
     }
 
     /// Discard every staged change. Does nothing on a finished transaction.
     pub fn rollback(&self) -> Result<(), MiniGrafError> {
+        self.refuse_own_statement()?;
         if let Some(tx) = lock(&self.inner)?.take() {
             tx.rollback();
         }
@@ -1045,7 +1093,7 @@ impl MiniGrafWriteTransaction {
 
     /// Whether the transaction is still open.
     pub fn is_open(&self) -> bool {
-        self.inner.lock().is_ok_and(|g| g.is_some())
+        self.in_own_statement() || self.inner.lock().is_ok_and(|g| g.is_some())
     }
 }
 
@@ -2725,6 +2773,152 @@ mod tests {
         assert_eq!(code(&err), "QRY-014");
         assert!(err.to_string().contains("INT-001"), "the cause is INT-001");
         tx.commit().expect("the transaction still commits");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol"]);
+    }
+
+    /// Calls the transaction it runs in (minigraf#886) and records what each
+    /// call returned.
+    #[derive(Default)]
+    struct CallsItsTx {
+        tx: Mutex<Option<Arc<MiniGrafWriteTransaction>>>,
+        seen: Mutex<Vec<(&'static str, String)>>,
+        fail: bool,
+    }
+    impl MiniGrafPredicate for CallsItsTx {
+        fn test(&self, _value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            let tx = self.tx.lock().expect("tx").clone().expect("a transaction");
+            let calls: [(&'static str, Result<(), MiniGrafError>); 3] = [
+                ("execute", tx.execute(NAMES.into()).map(|_| ())),
+                ("commit", tx.commit()),
+                ("rollback", tx.rollback()),
+            ];
+            let mut first = None;
+            let mut seen = self.seen.lock().expect("seen");
+            for (name, result) in calls {
+                let text = result.err().map(|e| e.to_string()).unwrap_or_default();
+                first.get_or_insert_with(|| text.clone());
+                seen.push((name, text));
+            }
+            seen.push(("is_open", tx.is_open().to_string()));
+            if self.fail {
+                return Err(MiniGrafUdfError::Failed {
+                    msg: first.unwrap_or_default(),
+                });
+            }
+            Ok(true)
+        }
+    }
+
+    const CALLS_TX: &str = "(query [:find ?n :where [?e :person/name ?n] [(calls-tx? ?n)]])";
+
+    /// A transaction on `db` with Carol staged and `calls-tx?` calling it.
+    fn tx_calling_itself(
+        db: &Arc<MiniGrafDb>,
+        fail: bool,
+    ) -> (Arc<MiniGrafWriteTransaction>, Arc<CallsItsTx>) {
+        let udf = Arc::new(CallsItsTx {
+            fail,
+            ..Default::default()
+        });
+        db.register_predicate("calls-tx?".into(), udf.clone())
+            .expect("register");
+        let tx = db.begin_write().expect("begin");
+        tx.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+            .expect("transact");
+        *udf.tx.lock().expect("tx") = Some(tx.clone());
+        (tx, udf)
+    }
+
+    #[test]
+    fn tx_refuses_a_call_from_its_own_statement() {
+        let db = tx_db();
+        let (tx, udf) = tx_calling_itself(&db, false);
+        let tx2 = tx.clone();
+        let (result, _recv) = within(STUCK, move || tx2.execute(CALLS_TX.into()));
+        let rows = result
+            .expect("the statement returns: no deadlock")
+            .expect("the function swallowed the refusals");
+        assert_eq!(names_of(&rows), ["Alice", "Bob", "Carol"]);
+        let seen = udf.seen.lock().expect("seen");
+        assert_eq!(seen.len(), 12, "four calls for each of three rows");
+        for (name, text) in seen.iter() {
+            if *name == "is_open" {
+                assert_eq!(text, "true", "open while its statement runs");
+            } else {
+                assert!(text.contains("[INT-001]"), "{name} is refused with INT-001");
+            }
+        }
+        drop(seen);
+        *udf.tx.lock().expect("tx") = None;
+        // Neither the refused commit nor the refused rollback finished it.
+        assert!(tx.is_open());
+        tx.commit().expect("the transaction still commits");
+        assert_eq!(db_names(&db), ["Alice", "Bob", "Carol"]);
+    }
+
+    #[test]
+    fn tx_refused_call_fails_the_query_when_passed_on() {
+        let db = tx_db();
+        let (tx, udf) = tx_calling_itself(&db, true);
+        let tx2 = tx.clone();
+        let (result, _recv) = within(STUCK, move || tx2.execute(CALLS_TX.into()));
+        let err = result
+            .expect("the statement returns: no deadlock")
+            .expect_err("the function passed the refusal on");
+        assert_eq!(code(&err), "QRY-014");
+        assert!(err.to_string().contains("INT-001"), "the cause is INT-001");
+        *udf.tx.lock().expect("tx") = None;
+        tx.rollback().expect("rollback");
+        assert_eq!(db_names(&db), ["Alice", "Bob"]);
+    }
+
+    /// Blocks inside a statement until told to go on.
+    struct Waits {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        go_on: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl MiniGrafPredicate for Waits {
+        fn test(&self, _value: MiniGrafValue) -> Result<bool, MiniGrafUdfError> {
+            let _ = self.entered.lock().expect("entered").send(());
+            let _ = self.go_on.lock().expect("go_on").recv();
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn tx_call_from_another_thread_waits_for_the_statement() {
+        let db = tx_db();
+        let (entered, has_entered) = std::sync::mpsc::channel();
+        let (go_on, may_go_on) = std::sync::mpsc::channel();
+        db.register_predicate(
+            "waits?".into(),
+            Arc::new(Waits {
+                entered: Mutex::new(entered),
+                go_on: Mutex::new(may_go_on),
+            }),
+        )
+        .expect("register");
+        let tx = db.begin_write().expect("begin");
+        let tx2 = tx.clone();
+        let statement = std::thread::spawn(move || {
+            tx2.execute(
+                r#"(query [:find ?n :where [:alice :person/name ?n] [(waits? ?n)]])"#.into(),
+            )
+        });
+        has_entered.recv_timeout(STUCK).expect("the statement runs");
+        // This thread is not the one running the statement: it waits.
+        let tx3 = tx.clone();
+        let (early, later) = within(WAITS, move || {
+            tx3.execute(r#"(transact [[:carol :person/name "Carol"]])"#.into())
+        });
+        assert!(early.is_none(), "a call from another thread waits");
+        go_on.send(()).expect("go on");
+        statement.join().expect("join").expect("the statement");
+        later
+            .recv_timeout(STUCK)
+            .expect("the waiting call runs")
+            .expect("transact");
+        tx.commit().expect("commit");
         assert_eq!(db_names(&db), ["Alice", "Bob", "Carol"]);
     }
 

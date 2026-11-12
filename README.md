@@ -244,7 +244,7 @@ try db.withWriteTransaction(options: TxOptions(chunkFacts: 10_000)) { tx in
   it when the last reference goes, but end it yourself rather than rely on that.
 - An open transaction holds the database's write lock until it finishes, so end every
   transaction explicitly or through `withWriteTransaction`. On the thread that began it, database
-  calls (`execute`, `query`, `prepare`, `factLog`, `checkpoint`, another `beginWrite`, prepared queries) fail with INT-001, and so do user functions its statements run. On
+  calls (`execute`, `query`, `prepare`, `factLog`, `checkpoint`, another `beginWrite`, prepared queries) fail with INT-001, and so do user functions its statements run. A user function that calls the transaction it runs in (`execute`, `commit`, `rollback`) gets INT-001 too. On
   other threads, writes and begins wait until it ends; queries read the committed
   state. Use a transaction on the thread that began it: a thread that uses one it did
   not begin and then writes through the database waits on that transaction.
