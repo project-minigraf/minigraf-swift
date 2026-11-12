@@ -259,6 +259,21 @@ final class Throws: MiniGrafPredicate {
     func test(value: MiniGrafValue) throws -> Bool { throw Own() }
 }
 
+/// Calls the transaction whose statement runs it (minigraf#886) and counts
+/// the calls refused with INT-001.
+final class CallsItsTx: MiniGrafPredicate {
+    let tx: MiniGrafWriteTransaction
+    init(_ tx: MiniGrafWriteTransaction) { self.tx = tx }
+    func test(value: MiniGrafValue) throws -> Bool {
+        let refused = [
+            errorText { _ = try tx.execute(datalog: "(query [:find ?n :where [?e :person/name ?n]])") },
+            errorText { try tx.commit() },
+            errorText { try tx.rollback() },
+        ].allSatisfy { $0.hasPrefix("[INT-001]") }
+        return refused && tx.isOpen()
+    }
+}
+
 final class BadRef: MiniGrafAggregate {
     final class Acc: MiniGrafAccumulator {
         func step(value: MiniGrafValue) throws {}
@@ -522,6 +537,17 @@ do {
     }
     let again = try MiniGrafDb.open(path: p)
     check(namesOf(try again.execute(datalog: names)).count == 7, "commits survive reopen")
+
+    // minigraf#886: a user function calling its own transaction waited forever.
+    let own = try MiniGrafDb.openInMemory()
+    _ = try own.execute(datalog: "(transact [[:alice :person/name \"Alice\"] [:bob :person/name \"Bob\"]])")
+    let tx = try own.beginWrite()
+    try own.registerPredicate(name: "calls-tx?", predicate: CallsItsTx(tx))
+    // A row passes only if every call was refused with INT-001 and isOpen was true.
+    check(namesOf(try tx.execute(datalog: "(query [:find ?n :where [?e :person/name ?n] [(calls-tx? ?n)]])")) == ["Alice", "Bob"],
+          "INT-001 for a user function calling its own transaction")
+    check(tx.isOpen(), "the refused commit and rollback left it open")
+    try tx.commit()
 }
 
 try? FileManager.default.removeItem(at: dir)
