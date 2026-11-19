@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: project-minigraf/minigraf
-          ref: ${{ inputs.core-ref }}
+          ref: ${{ env.CORE_REF }}
           path: core
       - uses: dtolnay/rust-toolchain@master
         with:
