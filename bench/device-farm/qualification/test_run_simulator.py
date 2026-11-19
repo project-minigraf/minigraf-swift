@@ -63,6 +63,12 @@ class DriverTests(unittest.TestCase):
             self.assertFalse(pending['valid'])
             self.assertIn('interrupted', pending['reason'])
             self.assertTrue((attempt_dir/'attempt.json').is_file())
+            # Driver metadata belongs in attempt.json, not the benchmark stream.
+            kwargs['stdout'].flush()
+            self.assertEqual((attempt_dir/'raw.log').read_text(), '')
+            # External tools can still emit unmarked JSON-like diagnostics.
+            kwargs['stdout'].write(json.dumps({'command': command, 'boot': 'ready'}, indent=2) + '\n')
+            kwargs['stdout'].write('{ platform:iOS Simulator, arch:arm64 }\n')
             records = copy.deepcopy(fixture.records)
             records[0]['run_id'] = records[-1]['run_id'] = f'synthetic-run-{len(processes)}'
             slowdown = command[-2].endswith('testQualificationSlowdown')

@@ -102,7 +102,7 @@ def run(args):
         # cancelled, partial logs still have a slot, attempt and explicit reason.
         pending_reason = 'no valid stream: attempt started; final result not recorded (interrupted if retained)'
         pending = parse_run('', build, set_name=name, run_index=index, attempt=attempt,
-                            platform='simulator', exit_code=1)
+                            platform='simulator', exit_code=1, prefixed_only=True)
         pending['reason'] = pending_reason
         for entry in pending['cases'].values():
             entry['reason'] = pending_reason
@@ -112,6 +112,8 @@ def run(args):
         code, reason = 1, ''
         reset_start = time.monotonic()
         measurement_start = None
+        # Keep command/boot metadata in attempt.json; raw.log is external output.
+        # xcodebuild diagnostics may contain unmarked JSON-like lines.
         with (destination / 'raw.log').open('w') as log:
             try:
                 # A failed prior process is killed by shutdown. Erase all app data before
@@ -142,7 +144,7 @@ def run(args):
                 log.write('\n' + reason + '\n')
         result = parse_run((destination / 'raw.log').read_text(errors='replace'), build,
                            set_name=name, run_index=index, attempt=attempt,
-                           platform='simulator', exit_code=code)
+                           platform='simulator', exit_code=code, prefixed_only=True)
         if result['valid']:
             run_id = result['environment']['run_id']
             if run_id in seen_run_ids:

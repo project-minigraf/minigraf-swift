@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 import unittest
 
 from parse_samples import CASES, parse_run
@@ -78,8 +79,28 @@ class ParseTests(unittest.TestCase):
 
     def test_jsonl_also_supported(self):
         stream = '\n'.join(json.dumps(r) for r in self.records)
-        self.assertTrue(parse_run(stream, self.build, set_name='B2', run_index=6,
-                                 attempt=3, platform='simulator', exit_code=0)['valid'])
+        for options in ({}, {'prefixed_only': False}):
+            with self.subTest(options=options):
+                result = parse_run(stream, self.build, set_name='B2', run_index=6,
+                                   attempt=3, platform='simulator', exit_code=0, **options)
+                self.assertTrue(result['valid'], result['reason'])
+                self.assertEqual(result['records'], self.records)
+
+    def test_prefixed_only_ignores_pretty_json_header_and_unmarked_lines(self):
+        header = json.dumps({'command': ['xcodebuild'], 'boot': {'state': 'Booted'}}, indent=2)
+        stream = header + '\n' + '\n'.join(
+            '2026 XCTest[123] MinigrafBench: ' + json.dumps(r) for r in self.records)
+        options = dict(set_name='B1', run_index=1, attempt=1, platform='simulator', exit_code=0)
+        previous = parse_run(stream, self.build, **options)
+        self.assertFalse(previous['valid'])
+        self.assertIn('Expecting property name enclosed in double quotes', previous['reason'])
+        for noise in ('', '\n{ platform:iOS Simulator, arch:arm64 }\n',
+                      '\n' + json.dumps(self.records[0]) + '\n'):
+            with self.subTest(noise=noise):
+                result = parse_run(noise + stream, self.build, prefixed_only=True, **options)
+                self.assertTrue(result['valid'], result['reason'])
+                self.assertEqual(len(result['records']), 157)
+                self.assertEqual(result['records'], self.records)
 
     def test_entire_suite_invalid_for_bad_streams(self):
         streams = [self.records[:-1], self.records*2, self.records + [self.records[2]]]
@@ -99,13 +120,14 @@ class ParseTests(unittest.TestCase):
         records = copy.deepcopy(self.records)
         records[1]['compiled_simulator'] = False
         streams.append(records)
-        for records in streams:
-            with self.subTest(records=records[:1]):
-                result = self.parse(records)
-                self.assertFalse(result['valid'])
-                self.assertTrue(result['reason'])
-                self.assertTrue(all(not c['valid'] and c['value_ns'] is None
-                                    for c in result['cases'].values()))
+        for prefixed_only in (False, True):
+            for records in streams:
+                with self.subTest(records=records[:1], prefixed_only=prefixed_only):
+                    result = self.parse(records, prefixed_only=prefixed_only)
+                    self.assertFalse(result['valid'])
+                    self.assertTrue(result['reason'])
+                    self.assertTrue(all(not c['valid'] and c['value_ns'] is None
+                                        for c in result['cases'].values()))
 
     def test_runtime_and_flag_drift_rejected(self):
         for record_index, field, value in (
@@ -127,9 +149,34 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(self.parse(exit_code=65)['valid'])
 
     def test_malformed_prefixed_record_is_not_ignored(self):
-        result = parse_run('MinigrafBench: {broken', self.build, set_name='B1',
-                           run_index=1, attempt=1, platform='simulator', exit_code=0)
-        self.assertFalse(result['valid'])
+        stream = '\n'.join('MinigrafBench: ' + json.dumps(r) for r in self.records)
+        for prefixed_only in (False, True):
+            with self.subTest(prefixed_only=prefixed_only):
+                result = parse_run(stream + '\nMinigrafBench: {broken', self.build,
+                                   set_name='B1', run_index=1, attempt=1, platform='simulator',
+                                   exit_code=0, prefixed_only=prefixed_only)
+                self.assertFalse(result['valid'])
+                self.assertIn('Expecting property name enclosed in double quotes', result['reason'])
+                self.assertTrue(all(not entry['valid'] for entry in result['cases'].values()))
+
+    def test_real_simulator_attempt_log(self):
+        logs = sorted(Path('/tmp/qs2').glob(
+            'qualification-858-ios-*/qualification-evidence/runs/*/raw.log'))
+        if not logs:
+            self.skipTest('real simulator attempt logs are absent')
+        log = logs[0]
+        build_path = log.parents[3] / 'binding/bench/device-farm/build/dist/build.json'
+        build = json.loads(build_path.read_text())
+        attempt = json.loads(log.with_name('attempt.json').read_text())
+        result = parse_run(log.read_text(errors='replace'), build,
+                           set_name=attempt['set'], run_index=attempt['run_index'],
+                           attempt=attempt['attempt'], platform='simulator',
+                           exit_code=attempt['exit_code'], prefixed_only=True)
+        self.assertTrue(result['valid'], result['reason'])
+        self.assertEqual(len(result['records']), 157)
+        self.assertEqual(set(result['cases']), set(CASES))
+        self.assertTrue(all(entry['valid'] and entry['value_ns'] is not None
+                            for entry in result['cases'].values()))
 
 
 if __name__ == '__main__':

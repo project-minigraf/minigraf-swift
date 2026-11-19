@@ -50,7 +50,9 @@ def unique_object(pairs):
     return result
 
 
-def parse_run(stream, build, *, set_name, run_index, attempt, platform, exit_code):
+def parse_run(stream, build, *, set_name, run_index, attempt, platform, exit_code,
+              prefixed_only: bool = False):
+    """In prefixed-only mode, ignore all lines without the MinigrafBench marker."""
     require(set_name in ('B1', 'B2', 'V'), 'unknown set')
     require(type(run_index) is int and 1 <= run_index <= 6, 'run index outside 1..6')
     require(type(attempt) is int and 1 <= attempt <= 3, 'attempt outside 1..3')
@@ -62,7 +64,7 @@ def parse_run(stream, build, *, set_name, run_index, attempt, platform, exit_cod
         for line in stream.splitlines():
             if 'MinigrafBench:' in line:
                 line = line.split('MinigrafBench:', 1)[1].strip()
-            elif not line.lstrip().startswith('{'):
+            elif prefixed_only or not line.lstrip().startswith('{'):
                 continue
             record = json.loads(line, object_pairs_hook=unique_object,
                                 parse_float=finite_float, parse_constant=invalid_constant)
