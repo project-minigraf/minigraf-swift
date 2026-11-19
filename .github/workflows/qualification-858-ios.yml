@@ -1,0 +1,153 @@
+name: iOS qualification 858 (experimental artifacts only)
+
+on:
+  push:
+    branches: [feat/858-qualification]
+    paths: [bench/device-farm/qualification/run-config.json]
+  workflow_dispatch:
+    inputs:
+      core-ref:
+        description: Full lowercase core commit SHA, pinned before qualification
+        required: true
+        type: string
+      collect:
+        description: Run the timed simulator batches (false = build and correctness only)
+        required: false
+        type: boolean
+        default: false
+      schedule:
+        description: Pre-registered order (B1,V,B2), repeated six times; other orders fail
+        required: true
+        type: string
+        default: B1,V,B2
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: config-source
+          sparse-checkout: bench/device-farm/qualification/run-config.json
+      - name: Resolve run configuration (inputs, or the committed config on push)
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          cfg = json.load(open('config-source/bench/device-farm/qualification/run-config.json'))
+          core = os.environ.get('IN_CORE') or cfg['core_ref']
+          sched = os.environ.get('IN_SCHED') or cfg['schedule']
+          print(f'CORE_REF={core}')
+          print(f'QUALIFICATION_SCHEDULE={sched}')
+          print(f'QUALIFICATION_COLLECT={"true" if os.environ.get("IN_COLLECT", cfg.get("collect", False)) in (True, "true") else "false"}')
+          PY
+        env:
+          IN_CORE: ${{ inputs.core-ref }}
+          IN_SCHED: ${{ inputs.schedule }}
+          IN_COLLECT: ${{ inputs.collect }}
+      - name: Validate protocol inputs
+        shell: bash
+        run: |
+          [[ "$CORE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo 'core-ref must be a full lowercase SHA' >&2; exit 1; }
+          [[ "$QUALIFICATION_SCHEDULE" == 'B1,V,B2' ]] || { echo 'Only the pre-registered B1,V,B2 x6 order is allowed' >&2; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          path: binding
+      - uses: actions/checkout@v4
+        with:
+          repository: project-minigraf/minigraf
+          ref: ${{ inputs.core-ref }}
+          path: core
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Record host and select exact iPhone 15 with newest available iOS 18.x
+        shell: bash
+        run: |
+          mkdir qualification-evidence
+          sw_vers > qualification-evidence/sw-vers.txt
+          uname -m > qualification-evidence/host-architecture.txt
+          xcodebuild -version > qualification-evidence/xcode-version.txt
+          xcrun simctl list runtimes --json > qualification-evidence/runtimes.json
+          xcrun simctl list devicetypes --json > qualification-evidence/devicetypes.json
+          python3 --version > qualification-evidence/python-version.txt
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import json, os, pathlib
+          keys = ('ImageOS', 'ImageVersion', 'RUNNER_OS', 'RUNNER_ARCH', 'GITHUB_SHA', 'GITHUB_WORKFLOW_SHA')
+          record = {key: os.environ.get(key, 'unavailable') for key in keys}
+          if record['ImageVersion'] == 'unavailable':
+              raise SystemExit('runner image version must be recorded before timing')
+          record.update(started_utc=datetime.now(timezone.utc).isoformat(),
+                        schedule=os.environ['QUALIFICATION_SCHEDULE'], runs_per_set=6,
+                        retries_per_slot=2, core_revision=os.environ['CORE_REF'],
+                        queue_seconds='not available from runner environment; retain Actions timestamps separately')
+          pathlib.Path('qualification-evidence/host.json').write_text(json.dumps(record, indent=2)+'\n')
+          PY
+          python3 binding/bench/device-farm/qualification/run_simulator.py select \
+            --output qualification-evidence/selection.json
+          cat qualification-evidence/selection.json
+      - name: Verify collection controls
+        run: python3 -m unittest discover -s binding/bench/device-farm/qualification -p 'test_*.py'
+      - name: Build matched device and simulator packages once; correctness only
+        shell: bash
+        run: |
+          start=$SECONDS
+          set +e
+          bash binding/bench/device-farm/build.sh core "$CORE_REF" qualification \
+            "$GITHUB_WORKSPACE/qualification-evidence/selection.json" \
+            2>&1 | tee qualification-evidence/build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "$((SECONDS-start))" > qualification-evidence/build-seconds.txt
+          exit "$status"
+      - name: Collect simulator B1,V,B2 x6 in fresh processes
+        if: env.QUALIFICATION_COLLECT == 'true'
+        run: |
+          python3 binding/bench/device-farm/qualification/run_simulator.py run \
+            --selection qualification-evidence/selection.json \
+            --build binding/bench/device-farm/build/build.json \
+            --harness binding/bench/device-farm \
+            --schedule "$QUALIFICATION_SCHEDULE" \
+            --output qualification-evidence/runs
+      - name: Checksum all retained evidence (including failed attempts)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p qualification-evidence
+          python3 - <<'PY'
+          import hashlib, pathlib
+          roots = [pathlib.Path(p) for p in (
+              'qualification-evidence', 'binding/bench/device-farm/build/dist',
+              'binding/bench/device-farm/build/evidence',
+              'binding/bench/device-farm/build/simulator/Build/Products',
+              'binding/bench/device-farm/build/minigrafFFI.xcframework')]
+          out = pathlib.Path('qualification-evidence/SHA256SUMS')
+          files = sorted(p for root in roots for p in root.rglob('*') if p.is_file() and p != out)
+          with out.open('w') as result:
+              for path in files:
+                  digest = hashlib.sha256()
+                  with path.open('rb') as source:
+                      for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                          digest.update(chunk)
+                  result.write(f'{digest.hexdigest()}  {path.as_posix()}\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualification-858-ios-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            qualification-evidence/
+            binding/bench/device-farm/build/dist/
+            binding/bench/device-farm/build/evidence/
+            binding/bench/device-farm/build/simulator/Build/Products/
+            binding/bench/device-farm/build/minigrafFFI.xcframework/
+          if-no-files-found: error
+          retention-days: 90
