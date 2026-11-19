@@ -45,7 +45,8 @@ jobs:
           sched = os.environ.get('IN_SCHED') or cfg['schedule']
           print(f'CORE_REF={core}')
           print(f'QUALIFICATION_SCHEDULE={sched}')
-          print(f'QUALIFICATION_COLLECT={"true" if os.environ.get("IN_COLLECT", cfg.get("collect", False)) in (True, "true") else "false"}')
+          collect = os.environ.get('IN_COLLECT') or cfg.get('collect', False)
+          print(f'QUALIFICATION_COLLECT={"true" if collect in (True, "true") else "false"}')
           PY
         env:
           IN_CORE: ${{ inputs.core-ref }}
