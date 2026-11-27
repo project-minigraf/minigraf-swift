@@ -10,6 +10,7 @@ final class BenchmarkTests: XCTestCase {
         "(transact [" + (0..<1000).map { "[:bench/e\($0) :bench/n \($0)]" }.joined(separator: " ") + "])"
     }()
     private var timed = false
+    private var doubleWork = false
     private var completed: [String] = []
     private var output: URL!
 
@@ -98,6 +99,10 @@ final class BenchmarkTests: XCTestCase {
         let id = "binding/swift-ios/" + name
         func invoke() throws -> UInt64 {
             try autoreleasepool {
+                if doubleWork {
+                    return try QualificationWork.invoke(setup: setup, action: action, validate: validate,
+                                                        cleanup: cleanup, clock: { DispatchTime.now().uptimeNanoseconds })
+                }
                 let state = try setup()
                 var failure: Error?
                 var elapsed: UInt64 = 0
@@ -151,34 +156,60 @@ final class BenchmarkTests: XCTestCase {
     }
     func testSmoke() throws { try run(timed: false) }
     func testBenchmark() throws {
-        #if targetEnvironment(simulator)
-        throw BenchmarkFailure.invalid("timing requires a physical Device Farm device")
-        #else
+        let platform = try PlatformIdentity()
+        try requireResult(platform.platform == "physical",
+                          "#839 release timing requires a physical Device Farm device; use testQualificationBaseline or testQualificationSlowdown for simulator qualification")
         try run(timed: true)
-        #endif
+    }
+    func testQualificationBaseline() throws { try run(timed: true, qualification: true) }
+    func testQualificationSlowdown() throws {
+        doubleWork = true
+        defer { doubleWork = false }
+        try run(timed: true, qualification: true)
     }
 
-    private func run(timed: Bool) throws {
+    private func run(timed: Bool, qualification: Bool = false) throws {
+        try requireResult(!doubleWork || (timed && qualification), "slowdown is qualification-only")
         self.timed = timed
         completed = []
-        let mode = timed ? "benchmark" : "smoke"
+        let mode = qualification ? "qualification" : (timed ? "benchmark" : "smoke")
+        let variant = doubleWork ? "slowdown" : "baseline"
+        let runID = UUID().uuidString
+        let platform = try PlatformIdentity()
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        output = documents.appendingPathComponent("minigraf-bench-\(mode).jsonl")
+        let suffix = qualification ? "qualification-\(variant)" : mode
+        output = documents.appendingPathComponent("minigraf-bench-\(suffix).jsonl")
         try Data().write(to: output)
         let metadataURL = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "build", withExtension: "json"))
         let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any])
-        // Keep NSLog records short; full metadata travels with the IPA artifact.
-        let keys = ["core_revision", "binding_revision", "harness_sha256", "native_sha256"]
-        let identity = metadata.filter { keys.contains($0.key) }
+        // Select the archive actually linked for this compile-time/runtime platform.
+        let artifacts = try XCTUnwrap(metadata["native_artifacts"] as? [String: [String: Any]])
+        let artifact = try XCTUnwrap(artifacts[platform.platform])
+        let nativeHash = try XCTUnwrap(artifact["sha256"] as? String)
+        let keys = qualification
+            ? ["core_revision", "binding_revision", "harness_revision", "harness_sha256"]
+            : ["core_revision", "binding_revision", "harness_sha256"]
+        var identity = metadata.filter { keys.contains($0.key) }
         try requireResult(identity.count == keys.count, "incomplete build identity")
-        var system = utsname(); uname(&system)
-        let machine = withUnsafeBytes(of: &system.machine) { bytes in
-            String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+        identity["native_sha256"] = nativeHash
+        var environment: [String: Any] = ["type": "environment", "mode": mode, "build": identity,
+            "platform": platform.platform, "model": platform.machine, "os": platform.os,
+            "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
+            "storage": "app-documents", "rss_verified": false]
+        if let model = platform.simulatorModel {
+            environment["simulator_model_identifier"] = model
+            for key in ["simulator_device_type", "simulator_runtime"] {
+                environment[key] = metadata[key]
+            }
         }
-        try emit(["type": "environment", "mode": mode, "build": identity,
-                  "model": machine, "os": UIDevice.current.systemVersion,
-                  "thermal_state": ProcessInfo.processInfo.thermalState.rawValue,
-                  "storage": "app-documents", "rss_verified": false])
+        if qualification {
+            environment["variant"] = variant
+            environment["double_work"] = doubleWork
+            environment["run_id"] = runID
+            environment["profile"] = try XCTUnwrap(metadata["profile"] as? String)
+        }
+        try emit(environment)
+        if qualification { try emit(platform.runtimeRecord(metadata: metadata)) }
         let directory = documents.appendingPathComponent("bench-839-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -226,10 +257,25 @@ final class BenchmarkTests: XCTestCase {
         }, validate: { try requireResult($0 == "[API-017]", "wrong error code") })
         let seed = directory.appendingPathComponent("seed.graph").path
         try seedFile(seed)
-        try memory("options_readonly_open/1k", action: {
-            try MiniGrafDb.openWithOptions(path: seed, options: OpenOptions(readOnly: true, pageCacheSize: 64,
-                                                                           queryMemoryLimit: 16 * 1024 * 1024))
-        }, validate: { try ResultChecks.numbers(self.result($0.execute(datalog: self.scalarQuery)), self.expected) })
+        if doubleWork {
+            // The original file preparation is outside all iterations. Keep that boundary,
+            // with two equivalent files and one independent read-only open on each.
+            let secondSeed = directory.appendingPathComponent("seed-second.graph").path
+            try seedFile(secondSeed)
+            var useSecond = false
+            try measure("options_readonly_open/1k", setup: {
+                defer { useSecond.toggle() }
+                return useSecond ? secondSeed : seed
+            }, action: { path in
+                try MiniGrafDb.openWithOptions(path: path, options: OpenOptions(readOnly: true, pageCacheSize: 64,
+                                                                               queryMemoryLimit: 16 * 1024 * 1024))
+            }, validate: { try ResultChecks.numbers(self.result($0.execute(datalog: self.scalarQuery)), self.expected) })
+        } else {
+            try memory("options_readonly_open/1k", action: {
+                try MiniGrafDb.openWithOptions(path: seed, options: OpenOptions(readOnly: true, pageCacheSize: 64,
+                                                                               queryMemoryLimit: 16 * 1024 * 1024))
+            }, validate: { try ResultChecks.numbers(self.result($0.execute(datalog: self.scalarQuery)), self.expected) })
+        }
         try measure("file_transact/1k", iterations: 1,
                     setup: { try FileState(directory.appendingPathComponent(UUID().uuidString + ".graph").path) },
                     action: { try $0.db!.execute(datalog: self.transaction) }, validate: { json in
@@ -253,7 +299,15 @@ final class BenchmarkTests: XCTestCase {
             try ResultChecks.numbers(self.result(reopened.execute(datalog: self.scalarQuery)), self.expected)
         })
         try requireResult(completed.count == 14 && Set(completed).count == 14, "incomplete benchmark")
-        try emit(["type": "complete", "mode": mode, "ids": completed, "count": completed.count,
-                  "thermal_state": ProcessInfo.processInfo.thermalState.rawValue])
+        if qualification {
+            // A completion marker certifies teardown too. Legacy modes retain their path.
+            try FileManager.default.removeItem(at: directory)
+            try emit(["type": "complete", "mode": mode, "variant": variant, "platform": platform.platform,
+                      "run_id": runID, "count": completed.count,
+                      "thermal_state": ProcessInfo.processInfo.thermalState.rawValue])
+        } else {
+            try emit(["type": "complete", "mode": mode, "ids": completed, "count": completed.count,
+                      "thermal_state": ProcessInfo.processInfo.thermalState.rawValue])
+        }
     }
 }

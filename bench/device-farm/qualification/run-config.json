@@ -1,0 +1,6 @@
+{
+  "core_ref": "b0d2d014d57c90680a6adc1d10e749a3db5df40c",
+  "schedule": "B1,V,B2",
+  "collect": true,
+  "note": "rerun after prefix-only parser fix; first collection 44513978880 retained as evidence"
+}
